@@ -1,0 +1,108 @@
+# episodic-memory stack -- docker-compose.yaml
+#
+# Services:
+#   episodic-memory-aura   -- RecallEngine HTTP API for Aura's store
+#   episodic-memory-tars   -- RecallEngine HTTP API for TARS's store
+#
+# Dependencies (already running in llm-service/docker-compose.yaml):
+#   memgraph               -- Bolt graph DB (port 7687 / 3000 UI)
+#
+# This compose joins the existing llm-shared-network so all services
+# can address each other by container name without port-binding conflicts.
+#
+# Usage:
+#   docker compose up -d
+#   curl http://localhost:8099/health   # Aura store
+#   curl http://localhost:8100/health   # TARS store
+#
+# Rebuild after code changes:
+#   docker compose build && docker compose up -d
+#
+# The stores are mounted read-only from the host -- write access is never
+# needed (encoding happens offline via encode_*_memories.py scripts).
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Aura episodic memory API
+  # Port 8099 -- used by CTM server and Hermes aura profile
+  # ---------------------------------------------------------------------------
+  episodic-memory-aura:
+    build:
+      context: .
+      dockerfile: service/Dockerfile
+    container_name: episodic-memory-aura
+    ports:
+      - "8099:8099"
+    environment:
+      - STORE_PATH=/stores/aura
+      - EMBEDDING_MODEL=/models/BAAI/bge-large-en-v1.5
+      - RECALL_THRESHOLD=0.55
+      - FILTER_ROLEPLAY=true
+      - PORT=8099
+    volumes:
+      # Memory store -- read-only, built by encode_aura_memories.py
+      - type: bind
+        source: ${HOME}/.ctm/memory/aura
+        target: /stores/aura
+        read_only: true
+      # BGE model -- shared with host HuggingFace cache to avoid re-download
+      # Symlink target: /models/huggingface/hub/models--BAAI--bge-large-en-v1.5
+      - type: bind
+        source: /models/huggingface/hub/models--BAAI--bge-large-en-v1.5
+        target: /models/BAAI/bge-large-en-v1.5
+        read_only: true
+    restart: unless-stopped
+    networks:
+      - llm-shared-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8099/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # BGE model load takes ~30s on first start
+
+  # ---------------------------------------------------------------------------
+  # TARS episodic memory API
+  # Port 8100 -- used by Hermes tars profile
+  # ---------------------------------------------------------------------------
+  episodic-memory-tars:
+    build:
+      context: .
+      dockerfile: service/Dockerfile
+    container_name: episodic-memory-tars
+    ports:
+      - "8100:8099"    # host:container -- container always listens on 8099
+    environment:
+      - STORE_PATH=/stores/tars
+      - EMBEDDING_MODEL=/models/BAAI/bge-large-en-v1.5
+      - RECALL_THRESHOLD=0.55
+      - FILTER_ROLEPLAY=true
+      - PORT=8099
+    volumes:
+      - type: bind
+        source: ${HOME}/.ctm/memory/tars
+        target: /stores/tars
+        read_only: true
+      - type: bind
+        source: /models/huggingface/hub/models--BAAI--bge-large-en-v1.5
+        target: /models/BAAI/bge-large-en-v1.5
+        read_only: true
+    restart: unless-stopped
+    networks:
+      - llm-shared-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8099/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+# ---------------------------------------------------------------------------
+# Network: join the existing llm-shared-network (declared in llm-service)
+# so containers can address each other by name (e.g. episodic-memory-aura:8099)
+# ---------------------------------------------------------------------------
+networks:
+  llm-shared-network:
+    external: true
+    name: llm-shared-network
