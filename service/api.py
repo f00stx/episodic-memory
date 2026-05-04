@@ -9,6 +9,7 @@ Endpoints:
     POST /query                -- semantic recall (returns RecallResult or null)
     POST /query_resonance      -- fast path only (returns ResonanceResult)
     GET  /stats                -- store statistics (episode count, emotion dist)
+    GET  /tags                 -- tag vocabulary with counts and expiry stats
 
 Configuration via environment variables:
     STORE_PATH          Path to episodes.db + hot_metadata.json (required)
@@ -23,8 +24,11 @@ encode_*_memories.py scripts and mounted as a volume.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import sqlite3
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -97,47 +101,51 @@ def query():
     Request body:
         {
           "query": "text to search for",
-          "exclude_session_id": "optional session id to exclude"
+          "exclude_session_id": "optional session id to exclude",
+          "exclude_tags": ["roleplay", "speculation"],
+          "only_tags": ["hardware"],
+          "include_expired": false
         }
 
-    Response:
-        {
-          "result": null | {
-            "summary": "...",
-            "context_injection": "...",    // formatted for system-prompt injection
-            "similarity": 0.72,
-            "dominant_emotion": "trust",
-            "is_superseded": false,
-            "superseded_by_summary": null,
-            "supersession_age_gap_str": null
-          }
-        }
+    Response: RecallResult dict or null
     """
     body = request.get_json(force=True, silent=True) or {}
-    text = (body.get("query") or "").strip()
+    text = (body.get("query") or body.get("text") or "").strip()
     if not text:
         return jsonify({"error": "query is required"}), 400
 
-    exclude = body.get("exclude_session_id")
+    exclude_session_id = body.get("exclude_session_id")
+    exclude_tags       = body.get("exclude_tags") or None
+    only_tags          = body.get("only_tags") or None
+    include_expired    = bool(body.get("include_expired", False))
 
     try:
         engine = _get_engine()
-        result = engine.query(text[:500], exclude_session_id=exclude)
+        result = engine.query(
+            text[:500],
+            exclude_session_id=exclude_session_id,
+            exclude_tags=exclude_tags,
+            only_tags=only_tags,
+            include_expired=include_expired,
+        )
         if result is None:
-            return jsonify({"result": None})
+            return jsonify(None)
         return jsonify({
-            "result": {
-                "summary":                 result.summary,
-                "context_injection":       result.context_injection(),
-                "similarity":              float(result.similarity),
-                "dominant_emotion":        result.dominant_emotion,
-                "is_superseded":           result.is_superseded,
-                "superseded_by_summary":   result.superseded_by_summary,
-                "supersession_age_gap_str": result.supersession_age_gap_str,
-            }
+            "session_id":             result.session_id,
+            "summary":                result.summary,
+            "context_injection":      result.context_injection(),
+            "similarity":             float(result.similarity),
+            "dominant_emotion":       result.dominant_emotion,
+            "dominant_archetype":     result.dominant_archetype,
+            "turn_count":             result.turn_count,
+            "stored_at":              result.stored_at,
+            "is_superseded":          result.is_superseded,
+            "superseded_by":          result.superseded_by,
+            "superseded_by_summary":  result.superseded_by_summary,
+            "supersession_age_gap":   result.supersession_age_gap_str,
         })
     except Exception as e:
-        logger.exception("Query error")
+        logger.exception("query error")
         return jsonify({"error": str(e)}), 500
 
 
@@ -157,64 +165,94 @@ def query_resonance():
         engine = _get_engine()
         res = engine.query_resonance(text[:500])
         return jsonify({
-            "triggered_recall":     res.triggered_recall,
-            "max_similarity":       float(res.max_similarity) if res.max_similarity else 0.0,
-            "top_k_ids":            res.top_k_ids or [],
-            "top_k_similarities":   [float(s) for s in (res.top_k_similarities or [])],
-            "blend": {
-                "dominant_emotion":   res.blend.dominant_emotion   if res.blend else None,
-                "dominant_archetype": res.blend.dominant_archetype if res.blend else None,
-            } if res.blend else None,
+            "triggered_recall":    res.triggered_recall,
+            "max_similarity":      float(res.max_similarity),
+            "resonance_strength":  float(res.resonance_strength),
+            "top_k_ids":           res.top_k_ids,
+            "top_k_similarities":  [float(s) for s in res.top_k_similarities],
         })
     except Exception as e:
-        logger.exception("Resonance query error")
+        logger.exception("query_resonance error")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/stats")
 def stats():
-    """Episode count + emotion/archetype distribution."""
-    import json
+    """Store statistics -- episode count, emotion distribution, tag distribution."""
+    try:
+        engine = _get_engine()
+        p = Path(STORE_PATH).expanduser()
 
-    store_p = Path(STORE_PATH).expanduser()
-    hot_path = store_p / "hot_metadata.json"
-    if not hot_path.exists():
-        return jsonify({"error": "hot_metadata.json not found"}), 404
+        conn = sqlite3.connect(str(p / "episodes.db"))
+        emotion_rows = conn.execute(
+            "SELECT dominant_emotion, COUNT(*) FROM episodes GROUP BY dominant_emotion ORDER BY 2 DESC"
+        ).fetchall()
+        arch_rows = conn.execute(
+            "SELECT dominant_archetype, COUNT(*) FROM episodes GROUP BY dominant_archetype ORDER BY 2 DESC"
+        ).fetchall()
+        conn.close()
 
-    hot = json.loads(hot_path.read_text())
-    episodes = list(hot.values()) if isinstance(hot, dict) else hot
-
-    emotion_counts: dict = {}
-    arch_counts: dict = {}
-    roleplay_count = 0
-
-    for ep in episodes:
-        dom_e = ep.get("dominant_emotion")
-        dom_a = ep.get("dominant_archetype")
-        if dom_e:
-            emotion_counts[dom_e] = emotion_counts.get(dom_e, 0) + 1
-        if dom_a:
-            arch_counts[dom_a] = arch_counts.get(dom_a, 0) + 1
-        if ep.get("is_roleplay"):
-            roleplay_count += 1
-
-    return jsonify({
-        "total_episodes":    len(episodes),
-        "roleplay_episodes": roleplay_count,
-        "emotion_distribution":   emotion_counts,
-        "archetype_distribution": arch_counts,
-    })
+        return jsonify({
+            "n_episodes":           engine.n_episodes,
+            "emotion_distribution": dict(emotion_rows),
+            "archetype_distribution": dict(arch_rows),
+        })
+    except Exception as e:
+        logger.exception("stats error")
+        return jsonify({"error": str(e)}), 500
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+@app.route("/tags")
+def tags():
+    """Tag vocabulary with counts and expiry statistics.
+
+    Returns:
+        {
+          "tag_counts": {"hardware": 42, "project": 120, ...},
+          "with_ttl": 55,
+          "expired": 3,
+          "vocabulary": ["completed", "config", "date_sensitive", ...]
+        }
+    """
+    try:
+        from episodic_memory.tagger import ALL_TAGS
+        p = Path(STORE_PATH).expanduser()
+        conn = sqlite3.connect(str(p / "episodes.db"))
+
+        rows = conn.execute("SELECT tags, expires_at FROM episodes").fetchall()
+        conn.close()
+
+        tag_counts: dict[str, int] = {t: 0 for t in ALL_TAGS}
+        with_ttl   = 0
+        expired    = 0
+        now        = time.time()
+
+        for row in rows:
+            try:
+                ep_tags = json.loads(row[0] or "[]")
+            except json.JSONDecodeError:
+                ep_tags = []
+            for t in ep_tags:
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+            exp = row[1]
+            if exp is not None:
+                with_ttl += 1
+                if now > float(exp):
+                    expired += 1
+
+        # Drop zero-count tags from output
+        tag_counts = {k: v for k, v in tag_counts.items() if v > 0}
+
+        return jsonify({
+            "tag_counts": tag_counts,
+            "with_ttl":   with_ttl,
+            "expired":    expired,
+            "vocabulary": sorted(ALL_TAGS),
+        })
+    except Exception as e:
+        logger.exception("tags error")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
-    # Eagerly load engine at startup (warm BGE model before first request)
-    try:
-        _get_engine()
-    except Exception as e:
-        logger.warning("Engine pre-warm failed (will retry on first request): %s", e)
-
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)

@@ -116,7 +116,10 @@ class RecallEngine:
     def query(
         self,
         text:               str,
-        exclude_session_id: Optional[str] = None,
+        exclude_session_id: Optional[str]   = None,
+        exclude_tags:       Optional[list]  = None,
+        only_tags:          Optional[list]  = None,
+        include_expired:    bool            = False,
     ) -> Optional["RecallResult"]:
         """
         Query episodic memory for episodes relevant to *text*.
@@ -144,7 +147,13 @@ class RecallEngine:
         resonance = self._get_resonance()
         recall_mod = self._get_recall()
 
-        res = resonance.query(text, exclude_session_id=exclude_session_id)
+        res = resonance.query(
+            text,
+            exclude_session_id=exclude_session_id,
+            exclude_tags=exclude_tags,
+            only_tags=only_tags,
+            include_expired=include_expired,
+        )
 
         if not res.triggered_recall or not res.top_k_ids:
             return None
@@ -226,6 +235,9 @@ class RecallEngine:
                         convert_to_numpy=True,
                     )
                     return np.array(vecs, dtype=np.float32)
+
+                def embed_one(self, text):
+                    return self.embed([text])[0]
 
             self._embed_client = _STClient(_st)
         return self._embed_client

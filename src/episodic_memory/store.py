@@ -138,6 +138,22 @@ class EpisodicMemoryStore:
         meta.setdefault("stored_at",          time.time())
         meta["session_id"] = session_id
 
+        # Auto-tag if not already provided -- uses summary if available
+        if "tags" not in meta:
+            try:
+                from episodic_memory.tagger import EpisodicTagger
+                _tagger = EpisodicTagger()
+                tag_result = _tagger.tag(
+                    summary=summary or "",
+                    stored_at=meta["stored_at"],
+                    metadata=meta,
+                )
+                meta["tags"]       = tag_result.tags
+                meta["expires_at"] = tag_result.expires_at
+            except Exception:
+                meta["tags"]       = []
+                meta["expires_at"] = None
+
         latent_f32 = np.asarray(latent, dtype=np.float32)
         if latent_f32.shape != (self.latent_dim,):
             raise ValueError(

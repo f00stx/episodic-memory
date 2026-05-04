@@ -29,6 +29,8 @@ Tuning guidance:
 """
 from __future__ import annotations
 
+import json
+import time
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -299,7 +301,8 @@ class DirectTextResonance:
         # Load summaries from cold store
         conn = sqlite3.connect(db_path)
         rows = conn.execute(
-            "SELECT session_id, summary, dominant_emotion, dominant_archetype, stored_at "
+            "SELECT session_id, summary, dominant_emotion, dominant_archetype, stored_at, "
+            "COALESCE(tags, '[]') as tags, expires_at "
             "FROM episodes WHERE summary IS NOT NULL AND summary != ''"
         ).fetchall()
         conn.close()
@@ -309,6 +312,8 @@ class DirectTextResonance:
         self._dom_emotions   = [r[2] for r in rows]
         self._dom_archetypes = [r[3] for r in rows]
         self._stored_ats     = [float(r[4]) if r[4] else 0.0 for r in rows]
+        self._tags           = [json.loads(r[5]) if r[5] else [] for r in rows]
+        self._expires_ats    = [float(r[6]) if r[6] is not None else None for r in rows]
 
         # Load hot metadata for emotion_cats lookup
         with open(hot_metadata_path) as f:
@@ -348,12 +353,25 @@ class DirectTextResonance:
         self,
         utterance_text:     str,
         exclude_session_id: str | None = None,
+        exclude_tags:       list[str] | None = None,
+        only_tags:          list[str] | None = None,
+        include_expired:    bool = False,
     ) -> "ResonanceResult":
         """
         Search episode summaries for semantic matches to *utterance_text*.
 
         Returns a ResonanceResult populated from the hot-tier metadata of
         matching episodes.  triggered_recall=True when max_sim >= recall_threshold.
+
+        Args:
+            utterance_text:     Text to search for.
+            exclude_session_id: Session ID to exclude from results.
+            exclude_tags:       Exclude episodes that have ANY of these tags.
+                                e.g. exclude_tags=["roleplay"] filters intimate episodes.
+            only_tags:          Only include episodes that have ALL of these tags.
+                                e.g. only_tags=["hardware"] to search hardware notes.
+            include_expired:    If False (default), skip episodes whose expires_at
+                                is in the past. Set True to search all episodes.
         """
         if self.n_episodes == 0:
             return ResonanceResult.null()
@@ -372,6 +390,26 @@ class DirectTextResonance:
         if exclude_session_id:
             for i, sid in enumerate(self._session_ids):
                 if sid == exclude_session_id:
+                    sims[i] = -1.0
+
+        # Exclude expired episodes (unless include_expired=True)
+        if not include_expired:
+            now = time.time()
+            for i, exp in enumerate(self._expires_ats):
+                if exp is not None and now > exp:
+                    sims[i] = -1.0
+
+        # Tag filtering
+        if exclude_tags:
+            exclude_set = set(exclude_tags)
+            for i, ep_tags in enumerate(self._tags):
+                if exclude_set.intersection(ep_tags):
+                    sims[i] = -1.0
+
+        if only_tags:
+            only_set = set(only_tags)
+            for i, ep_tags in enumerate(self._tags):
+                if not only_set.issubset(set(ep_tags)):
                     sims[i] = -1.0
 
         top_idx = np.argsort(sims)[::-1][: self.top_k * 4]   # over-fetch to survive filtering
