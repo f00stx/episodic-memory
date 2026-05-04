@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "episodic-memory"
+version = "0.1.0"
+description = "Episodic memory system with roleplay filtering and temporal contradiction detection -- extracted from Project Aura / CTM."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Richard", email = "richard@rickamai.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "sentence-transformers>=2.2",
+    "faiss-cpu>=1.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-asyncio"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
