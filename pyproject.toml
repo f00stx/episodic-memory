@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "episodic-memory"
 version = "0.1.0"
-description = "Episodic memory system with roleplay filtering and temporal contradiction detection -- extracted from Project Aura / CTM."
+description = "Episodic memory system for AI agents -- semantic recall, roleplay filtering, and temporal contradiction detection."
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "Richard", email = "richard@rickamai.com" }]
+authors = [{ name = "f00stx" }]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",

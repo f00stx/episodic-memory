@@ -76,8 +76,10 @@ _SPECULATION_PAT = re.compile(
 )
 
 _PERSON_PAT = re.compile(
-    r"\b(richard|charlie|jonathan|henry|aura|ava|tars|sally|"
-    r"shrapnel|will\s+shrapnel|helimods)\b",
+    # Generic first-name list -- extend this with names relevant to your agent
+    # and the people it regularly talks to or about.
+    r"\b(alice|bob|charlie|dave|eve|frank|grace|heidi|"
+    r"ivan|judy|mallory|oscar|peggy|trent|victor|wendy)\b",
     re.IGNORECASE,
 )
 
@@ -91,7 +93,7 @@ _PROJECT_PAT = re.compile(
 _CONFIG_PAT = re.compile(
     r"("
     r"port\s+\d{4,5}|"                          # port 8001, port 5050
-    r"/home/richard/[^\s,]+|"                   # file paths
+    r"/home/[^/\s]+/[^\s,]+|"                   # file paths (/home/<user>/...)
     r"localhost:\d{4,5}|"                       # localhost:5050
     r"\b(nginx|docker|systemd|compose|env\s+var|"
     r"config\.yaml|\.service|\.conf|\.env|"

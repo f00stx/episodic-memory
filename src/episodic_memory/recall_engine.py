@@ -10,7 +10,7 @@ Usage (standalone)::
     from episodic_memory.recall_engine import RecallEngine
 
     engine = RecallEngine("/path/to/memory/store")
-    result = engine.query("V100 SXM2 NVLink installation")
+    result = engine.query("what did we talk about last time?")
     if result:
         print(result.summary)          # LLM-generated gist of the recalled episode
         print(result.similarity)       # cosine similarity (0-1)
@@ -65,7 +65,7 @@ class RecallEngine:
     recall_threshold:
         Minimum cosine similarity to trigger slow-path recall and return a
         ``RecallResult``.  Below this, ``query()`` returns ``None``.
-        Default 0.55 is calibrated for BGE-large-en-v1.5 on Aura session data.
+        Default 0.55 works well for bge-small-en-v1.5 and bge-large-en-v1.5.
     resonance_threshold:
         Minimum similarity for a candidate to contribute to the emotional
         resonance blend (fast path).  Default 0.45.
@@ -93,7 +93,7 @@ class RecallEngine:
         top_k:               int   = 5,
         filter_roleplay:     bool  = True,
         embedding_device:    str   = "cpu",
-        embedding_model:     str   = "BAAI/bge-large-en-v1.5",
+        embedding_model:     str   = "BAAI/bge-small-en-v1.5",
     ) -> None:
         self._store_path = Path(store_path).expanduser()
         self._recall_threshold    = recall_threshold
@@ -218,7 +218,7 @@ class RecallEngine:
             from sentence_transformers import SentenceTransformer
 
             _model_name = getattr(self, "_embedding_model",
-                                  "BAAI/bge-large-en-v1.5")
+                                  "BAAI/bge-small-en-v1.5")
             _device = getattr(self, "_embedding_device", "cpu")
             _st = SentenceTransformer(_model_name, device=_device)
 
@@ -250,7 +250,7 @@ class RecallEngine:
             if not db.exists():
                 raise FileNotFoundError(
                     f"episodes.db not found at {db}. "
-                    "Run encode_aura_memories.py to build the memory store."
+                    "Run your encode script to build the memory store first."
                 )
             if not hot.exists():
                 raise FileNotFoundError(

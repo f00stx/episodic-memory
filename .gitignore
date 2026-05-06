@@ -9,3 +9,11 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local environment -- copy .env.example and fill in your values
+.env
+
+# Memory stores -- never commit actual episode data
+*.db
+hot_latents.npy
+hot_metadata.json

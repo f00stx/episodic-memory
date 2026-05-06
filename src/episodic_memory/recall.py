@@ -82,8 +82,8 @@ class EpisodicRecall:
 
         recall = EpisodicRecall(
             store=store,
-            llm_base_url="https://llmsvc.rickamai.com/v1",
-            llm_model="qwen-main",
+            llm_base_url="http://localhost:11434/v1",  # Ollama default; any OpenAI-compatible endpoint
+            llm_model="llama3",
         )
 
         # Called when ResonanceResult.triggered_recall is True
@@ -105,8 +105,8 @@ class EpisodicRecall:
     def __init__(
         self,
         store:                 "EpisodicMemoryStore",
-        llm_base_url:          str   = "https://llmsvc.rickamai.com/v1",
-        llm_model:             str   = "qwen-main",
+        llm_base_url:          str   = "http://localhost:11434/v1",
+        llm_model:             str   = "llama3",
         llm_api_key:           str   = "none",
         max_transcript_turns:  int   = 30,
         summary_max_tokens:    int   = 150,
