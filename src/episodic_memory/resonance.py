@@ -320,19 +320,17 @@ class DirectTextResonance:
             hot_meta_list = json.load(f)
         self._hot_meta = {m["session_id"]: m for m in hot_meta_list}
 
-        # Pre-compute summary embeddings (1536-dim, unit-normed)
+        # Pre-compute summary embeddings (1536-dim, unit-normed) -- batched for speed
         import logging
         log = logging.getLogger(__name__)
         log.info(
             "DirectTextResonance: pre-computing %d summary embeddings...",
             len(self._summaries),
         )
-        embs = []
-        for s in self._summaries:
-            e = self.embedding_client.embed_one(s)
-            norm = np.linalg.norm(e)
-            embs.append(e / (norm + 1e-8))
-        self._summary_embs = np.array(embs, dtype=np.float32)  # (N, 1536)
+        # Batch all summaries in one call -- ~100x faster than individual embed_one() calls
+        raw_embs = self.embedding_client.embed(self._summaries)  # (N, 1536)
+        norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
+        self._summary_embs = (raw_embs / (norms + 1e-8)).astype(np.float32)
         log.info("DirectTextResonance: ready (%d episodes indexed)", len(self._summaries))
 
         # Build ContradictionDetector over the same embeddings (no extra embedding cost)
