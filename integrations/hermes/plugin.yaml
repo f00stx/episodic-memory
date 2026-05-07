@@ -1,0 +1,12 @@
+name: episodic_memory
+version: "1.0"
+description: "Episodic memory provider -- semantic recall from past sessions with roleplay filtering and temporal supersession detection. Wraps the standalone episodic-memory library. Store is agent-scoped ($HERMES_HOME/episodic_memory/<profile>/ by default). Built and maintained offline via encode_*_memories.py scripts."
+author: "f00stx"
+hooks:
+  - prefetch
+  - queue_prefetch
+  - system_prompt_block
+  - on_session_end
+  - shutdown
+requires:
+  - episodic-memory

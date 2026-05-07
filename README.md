@@ -1,35 +1,35 @@
 # episodic-memory
 
-Standalone episodic memory system for AI agents -- semantic recall, roleplay filtering, and temporal contradiction detection. Lightweight enough to run on a laptop; designed to plug into any OpenAI-compatible agent pipeline.
+Standalone episodic memory system for AI agents - semantic recall, roleplay filtering, and temporal contradiction detection. Lightweight enough to run on a laptop; designed to plug into any OpenAI-compatible agent pipeline.
 
-## TL;DR -- why this exists
+## TL;DR - why this exists
 
 Most agent memory systems are either a vector database bolted to a retriever, or a raw context window that grows until it breaks. Neither handles the messy reality of long-running agents well:
 
-- **Contradiction** -- if the user's setup changed last month, the old episode is worse than useless. It silently poisons the context. Most systems return it anyway.
-- **Mixed sessions** -- agents that do both factual work and creative/roleplay sessions will hallucinate across the boundary if you don't filter. Vector similarity doesn't distinguish "we debugged a deployment" from "we roleplayed a deployment."
-- **Retrieval latency** -- a full embedding lookup on every turn is overkill. Most turns don't need episodic context at all.
+- **Contradiction** - if the user's setup changed last month, the old episode is worse than useless. It silently poisons the context. Most systems return it anyway.
+- **Mixed sessions** - agents that do both factual work and creative/roleplay sessions will hallucinate across the boundary if you don't filter. Vector similarity doesn't distinguish "we debugged a deployment" from "we roleplayed a deployment."
+- **Retrieval latency** - a full embedding lookup on every turn is overkill. Most turns don't need episodic context at all.
 
-This library came out of building a persistent AI agent designed to maintain genuine continuity across hundreds of sessions. The three features above -- temporal supersession, roleplay filtering, and two-tier fast/slow retrieval -- were the hard-won lessons. They're packaged here as a standalone drop-in with no required external services.
+This library came out of building a persistent AI agent designed to maintain genuine continuity across hundreds of sessions. The three features above - temporal supersession, roleplay filtering, and two-tier fast/slow retrieval - were the hard-won lessons. They're packaged here as a standalone drop-in with no required external services.
 
 **What makes it different from LangChain memory / Mem0 / etc:**
-- Temporal supersession is explicit and injected into the prompt -- the agent *knows* a memory may be outdated, not just that it exists
-- Roleplay filter is heuristic (O(1), no embeddings) -- prevents fiction bleed without adding a classifier
+- Temporal supersession is explicit and injected into the prompt - the agent *knows* a memory may be outdated, not just that it exists
+- Roleplay filter is heuristic (O(1), no embeddings) - prevents fiction bleed without adding a classifier
 - Two-tier store (numpy hot path + SQLite cold) means sub-5ms retrieval up to ~100K episodes without a vector DB
-- No managed service dependency -- runs fully local, SQLite is the only required storage backend
+- No managed service dependency - runs fully local, SQLite is the only required storage backend
 
 ## What it does
 
-- **Semantic recall** -- `RecallEngine.query(text)` returns the most relevant past episode using cosine similarity over BGE embeddings. Sub-5ms for stores up to ~100K episodes.
-- **Two-tier store** -- hot tier (numpy + JSON) for fast similarity search; cold tier (SQLite) for full transcripts and metadata. No external database required.
-- **Roleplay filter** -- 50+ keyword tells exclude fiction/RP sessions from factual recall. Prevents hallucination-amplification when your agent has mixed session types.
-- **Temporal supersession** -- `ContradictionDetector` flags older episodes on the same topic as outdated when a newer one covers the same ground (sim ≥ 0.75, >1 day newer). Injected context leads with `[POSSIBLY OUTDATED -- N weeks later: ...]`.
-- **Semantic tagging** -- zero-cost heuristic tags (`hardware`, `speculation`, `person`, `config`, `completed`, `error`, ...) with TTL-based auto-expiry. Filter recall by tag.
+- **Semantic recall** - `RecallEngine.query(text)` returns the most relevant past episode using cosine similarity over BGE embeddings. Sub-5ms for stores up to ~100K episodes.
+- **Two-tier store** - hot tier (numpy + JSON) for fast similarity search; cold tier (SQLite) for full transcripts and metadata. No external database required.
+- **Roleplay filter** - 50+ keyword tells exclude fiction/RP sessions from factual recall. Prevents hallucination-amplification when your agent has mixed session types.
+- **Temporal supersession** - `ContradictionDetector` flags older episodes on the same topic as outdated when a newer one covers the same ground (sim >= 0.75, >1 day newer). Injected context leads with `[POSSIBLY OUTDATED - N weeks later: ...]`.
+- **Semantic tagging** - zero-cost heuristic tags (`hardware`, `speculation`, `person`, `config`, `completed`, `error`, ...) with TTL-based auto-expiry. Filter recall by tag.
 
 ## Quick start
 
 ```bash
-pip install episodic-memory
+pip install git+https://github.com/f00stx/episodic-memory
 ```
 
 ```python
@@ -40,13 +40,13 @@ result = engine.query("what microphone setup did we use?")
 if result:
     print(result.context_injection())  # ready-to-inject system prompt block
     if result.is_superseded:
-        print(f"⚠ Superseded {result.supersession_age_gap_str} later")
+        print(f"Superseded {result.supersession_age_gap_str} later")
 ```
 
 `context_injection()` returns a formatted block like:
 
 ```
-[Memory -- 0.82 similarity, 3 weeks ago]
+[Memory - 0.82 similarity, 3 weeks ago]
 The user and agent worked through an API endpoint configuration issue.
 The session ended with a working setup confirmed against the staging environment.
 Tone: collaborative, methodical.
@@ -79,38 +79,38 @@ store.add(
 )
 ```
 
-The `latent` vector can be zeros if you don't have a custom encoder -- `RecallEngine` re-embeds summaries via BGE at query time regardless.
+The `latent` vector can be zeros if you don't have a custom encoder - `RecallEngine` re-embeds summaries via BGE at query time regardless.
 
 ## Architecture
 
 ```
-RecallEngine              ← start here (high-level API)
-├── DirectTextResonance   ← BGE cosine search over cached summary embeddings
-│   ├── RoleplayFilter    ← keyword triage, O(1), no embeddings
-│   └── ContradictionDetector ← temporal supersession check
-├── EpisodicRecall        ← fetches full episode + LLM-generated summary
-└── EpisodicMemoryStore   ← two-tier hot (numpy) / cold (SQLite) store
+RecallEngine              <- start here (high-level API)
++-- DirectTextResonance   <- BGE cosine search over cached summary embeddings
+|   +-- RoleplayFilter    <- keyword triage, O(1), no embeddings
+|   +-- ContradictionDetector <- temporal supersession check
++-- EpisodicRecall        <- fetches full episode + LLM-generated summary
++-- EpisodicMemoryStore   <- two-tier hot (numpy) / cold (SQLite) store
 ```
 
 Two-tier design mirrors neuroscience:
-- **Fast path** (amygdala-style, <5ms) -- cosine similarity over pre-embedded summaries, blended emotional resonance
-- **Slow path** (hippocampal, 100-500ms) -- triggered only when similarity exceeds `recall_threshold`; fetches transcript + generates/caches a natural-language gist via local LLM
+- **Fast path** (amygdala-style, <5ms) - cosine similarity over pre-embedded summaries, blended emotional resonance
+- **Slow path** (hippocampal, 100-500ms) - triggered only when similarity exceeds `recall_threshold`; fetches transcript + generates/caches a natural-language gist via local LLM
 
 ## Embedding model
 
 The default model is `BAAI/bge-small-en-v1.5` (133MB, loads in ~5s, good quality):
 
 ```python
-# Default -- small and fast, good for most use cases
+# Default - small and fast, good for most use cases
 engine = RecallEngine(store_path="~/.my_agent/memory")
 
-# Higher quality -- 1.3GB, ~30s load time
+# Higher quality - 1.3GB, ~30s load time
 engine = RecallEngine(
     store_path="~/.my_agent/memory",
     embedding_model="BAAI/bge-large-en-v1.5",
 )
 
-# OpenAI embeddings -- zero local model, costs money
+# OpenAI embeddings - zero local model, costs money
 # Pass a custom embed_fn instead (see Advanced usage)
 ```
 
@@ -132,8 +132,8 @@ The service exposes:
 | Endpoint | Method | Description |
 |---|---|---|
 | `/health` | GET | Liveness + episode count |
-| `/query` | POST | Semantic recall → `RecallResult` or null |
-| `/query_resonance` | POST | Fast path only → `ResonanceResult` |
+| `/query` | POST | Semantic recall -> `RecallResult` or null |
+| `/query_resonance` | POST | Fast path only -> `ResonanceResult` |
 | `/stats` | GET | Episode count, emotion distribution |
 | `/tags` | GET | Tag vocabulary with counts and expiry stats |
 
@@ -158,11 +158,11 @@ recall = EpisodicRecall(
 )
 ```
 
-Summaries are persisted to SQLite after generation -- the LLM is only called once per episode.
+Summaries are persisted to SQLite after generation - the LLM is only called once per episode.
 
 ## Semantic tags
 
-Episodes are tagged automatically at store time -- zero LLM cost:
+Episodes are tagged automatically at store time - zero LLM cost:
 
 ```python
 from episodic_memory.tagger import EpisodicTagger
@@ -189,17 +189,25 @@ result = engine.query(
 )
 ```
 
-The `_PERSON_PAT` regex in `tagger.py` contains a generic placeholder name list -- replace it with the names relevant to your agent and the people it interacts with.
+The `_PERSON_PAT` regex in `tagger.py` contains a generic placeholder name list - replace it with the names relevant to your agent and the people it interacts with.
 
 ## Requirements
 
-- Python ≥ 3.10
-- PyTorch ≥ 2.0
-- sentence-transformers ≥ 2.2 (pulls in the embedding model)
-- numpy ≥ 1.24
-- faiss-cpu ≥ 1.7 (optional -- used if installed, falls back to numpy dot-product)
+- Python >= 3.10
+- PyTorch >= 2.0
+- sentence-transformers >= 2.2 (pulls in the embedding model)
+- numpy >= 1.24
+- faiss-cpu >= 1.7 (optional - used if installed, falls back to numpy dot-product)
 
 For summary generation: any OpenAI-compatible LLM endpoint (Ollama, LM Studio, vLLM, OpenAI API).
+
+## Integrations
+
+### Hermes Agent
+
+A drop-in memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearch) is included in `integrations/hermes/`. It wires episodic recall into the Hermes turn loop via the `prefetch`/`queue_prefetch` pattern - zero added turn latency - and exposes `hermes episodic-memory status/stats/search` CLI commands.
+
+See [`integrations/hermes/README.md`](integrations/hermes/README.md) for setup.
 
 ## License
 
