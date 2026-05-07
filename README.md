@@ -2,6 +2,22 @@
 
 Standalone episodic memory system for AI agents -- semantic recall, roleplay filtering, and temporal contradiction detection. Lightweight enough to run on a laptop; designed to plug into any OpenAI-compatible agent pipeline.
 
+## TL;DR -- why this exists
+
+Most agent memory systems are either a vector database bolted to a retriever, or a raw context window that grows until it breaks. Neither handles the messy reality of long-running agents well:
+
+- **Contradiction** -- if the user's setup changed last month, the old episode is worse than useless. It silently poisons the context. Most systems return it anyway.
+- **Mixed sessions** -- agents that do both factual work and creative/roleplay sessions will hallucinate across the boundary if you don't filter. Vector similarity doesn't distinguish "we debugged a deployment" from "we roleplayed a deployment."
+- **Retrieval latency** -- a full embedding lookup on every turn is overkill. Most turns don't need episodic context at all.
+
+This library came out of building a persistent AI agent designed to maintain genuine continuity across hundreds of sessions. The three features above -- temporal supersession, roleplay filtering, and two-tier fast/slow retrieval -- were the hard-won lessons. They're packaged here as a standalone drop-in with no required external services.
+
+**What makes it different from LangChain memory / Mem0 / etc:**
+- Temporal supersession is explicit and injected into the prompt -- the agent *knows* a memory may be outdated, not just that it exists
+- Roleplay filter is heuristic (O(1), no embeddings) -- prevents fiction bleed without adding a classifier
+- Two-tier store (numpy hot path + SQLite cold) means sub-5ms retrieval up to ~100K episodes without a vector DB
+- No managed service dependency -- runs fully local, SQLite is the only required storage backend
+
 ## What it does
 
 - **Semantic recall** -- `RecallEngine.query(text)` returns the most relevant past episode using cosine similarity over BGE embeddings. Sub-5ms for stores up to ~100K episodes.
@@ -31,9 +47,9 @@ if result:
 
 ```
 [Memory -- 0.82 similarity, 3 weeks ago]
-The user and agent worked through a microphone input routing issue on an XMOS
-eval board. The session ended with a successful test signal confirmed on the
-LINE IN jack. Tone: collaborative, methodical.
+The user and agent worked through an API endpoint configuration issue.
+The session ended with a working setup confirmed against the staging environment.
+Tone: collaborative, methodical.
 ```
 
 Drop that into your system prompt before generating a response.
