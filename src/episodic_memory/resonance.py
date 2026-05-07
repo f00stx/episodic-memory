@@ -321,16 +321,38 @@ class DirectTextResonance:
         self._hot_meta = {m["session_id"]: m for m in hot_meta_list}
 
         # Pre-compute summary embeddings (1536-dim, unit-normed) -- batched for speed
-        import logging
+        # Cache to disk keyed by MD5 of session IDs -- avoids recompute on restart
+        import hashlib, logging
         log = logging.getLogger(__name__)
-        log.info(
-            "DirectTextResonance: pre-computing %d summary embeddings...",
-            len(self._summaries),
-        )
-        # Batch all summaries in one call -- ~100x faster than individual embed_one() calls
-        raw_embs = self.embedding_client.embed(self._summaries)  # (N, 1536)
-        norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
-        self._summary_embs = (raw_embs / (norms + 1e-8)).astype(np.float32)
+
+        cache_dir  = os.path.join(os.path.dirname(db_path), "embed_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key  = hashlib.md5("".join(self._session_ids).encode()).hexdigest()
+        cache_path = os.path.join(cache_dir, f"summary_embs_{cache_key}.npy")
+        db_mtime   = os.path.getmtime(db_path)
+
+        if (
+            os.path.exists(cache_path)
+            and os.path.getmtime(cache_path) >= db_mtime
+        ):
+            log.info(
+                "DirectTextResonance: loading %d cached embeddings from disk...",
+                len(self._summaries),
+            )
+            self._summary_embs = np.load(cache_path)
+        else:
+            log.info(
+                "DirectTextResonance: pre-computing %d summary embeddings...",
+                len(self._summaries),
+            )
+            # Batch all summaries in one call -- ~100x faster than individual embed_one() calls
+            raw_embs = self.embedding_client.embed(self._summaries)  # (N, 1536)
+            norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
+            self._summary_embs = (raw_embs / (norms + 1e-8)).astype(np.float32)
+            np.save(cache_path, self._summary_embs)
+            log.info(
+                "DirectTextResonance: embeddings cached -> %s", cache_path,
+            )
         log.info("DirectTextResonance: ready (%d episodes indexed)", len(self._summaries))
 
         # Build ContradictionDetector over the same embeddings (no extra embedding cost)
