@@ -455,6 +455,10 @@ class EpisodicMemoryStore:
                 conn.execute("ALTER TABLE episodes ADD COLUMN dominant_emotion TEXT NOT NULL DEFAULT 'neutral'")
             if "dominant_archetype" not in existing:
                 conn.execute("ALTER TABLE episodes ADD COLUMN dominant_archetype TEXT NOT NULL DEFAULT 'companion'")
+            if "tags" not in existing:
+                conn.execute("ALTER TABLE episodes ADD COLUMN tags TEXT")
+            if "expires_at" not in existing:
+                conn.execute("ALTER TABLE episodes ADD COLUMN expires_at REAL")
             conn.commit()
 
     def _upsert_cold(

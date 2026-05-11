@@ -8,11 +8,14 @@ as a Hermes MemoryProvider.  Provides:
   * Supersession annotations -- stale memories flagged with "[POSSIBLY OUTDATED]"
   * Emotional resonance -- fast-path affective colouring without a full recall hit
   * ``episodic_recall`` tool -- deliberate agent-triggered recall
+  * Live encoding -- turns buffered in sync_turn() and flushed to the store
+    every ``flush_min_turns`` turns and at session end, matching Hermes memory
+    management conventions (nudge_interval / flush_min_turns from config.yaml)
 
 Store layout (agent-scoped, never shared):
     $HERMES_HOME/episodic_memory/<agent_name>/
-        episodes.db          ← cold SQLite tier
-        hot_metadata.json    ← hot JSON tier
+        episodes.db          <- cold SQLite tier
+        hot_metadata.json    <- hot JSON tier (created on first flush if absent)
 
 The ``$HERMES_HOME`` path is provided by Hermes at ``initialize()`` time, so each
 profile gets its own isolated store automatically.  No hardcoded paths.
@@ -20,15 +23,17 @@ profile gets its own isolated store automatically.  No hardcoded paths.
 Configuration (config.yaml):
     memory:
       provider: episodic_memory
+      nudge_interval: 10          # turns between memory-use reminders (Hermes native)
+      flush_min_turns: 6          # turns to buffer before encoding to store (Hermes native)
       episodic_memory:
-        store_path: ~/.ctm/memory/aura          # optional override; default = $HERMES_HOME/episodic_memory/<profile>
-        embedding_model: BAAI/bge-large-en-v1.5 # model name or absolute local path
-        recall_threshold: 0.55                  # minimum cosine similarity to inject
-        filter_roleplay: true                   # exclude RP/fiction from factual recall
-        agent_name: aura                        # store subdirectory name (defaults to profile name)
+        store_path: ~/.ctm/memory/aura          # optional override
+        embedding_model: BAAI/bge-large-en-v1.5
+        recall_threshold: 0.55
+        filter_roleplay: true
+        agent_name: aura                        # store subdirectory (defaults to profile name)
 
 Dependencies (must be available in Hermes venv):
-    pip install git+https://github.com/f00stx/episodic-memory
+    pip install episodic-memory
     # or: pip install /home/richard/projects/episodic-memory
 """
 
@@ -36,11 +41,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 from agent.memory_provider import MemoryProvider
 
@@ -89,27 +96,50 @@ class EpisodicMemoryProvider(MemoryProvider):
         prefetch()          -- return pre-warmed recall result (from queue_prefetch)
         queue_prefetch()    -- background semantic query for next turn
         system_prompt_block() -- static description (engine availability check)
-        sync_turn()         -- no-op (episodic store is read-only from plugin side;
-                               sessions are encoded offline via encode_*_memories.py)
-        on_session_end()    -- no-op (same reason)
-        shutdown()          -- join prefetch thread
+        sync_turn()         -- buffer turn; flush to store every flush_min_turns turns
+        on_session_end()    -- force-flush remaining buffered turns then join threads
+        shutdown()          -- join all background threads
     """
+
+    # Minimum number of turns to buffer before flush is considered worthwhile.
+    # Overridden by config flush_min_turns at initialize() time.
+    _DEFAULT_FLUSH_MIN_TURNS: int = 6
 
     def __init__(self) -> None:
         self._store_path: Optional[Path] = None
         self._embedding_model: str = "BAAI/bge-large-en-v1.5"
         self._recall_threshold: float = 0.55
         self._filter_roleplay: bool = True
+
+        # True once store is confirmed to exist OR has been successfully created.
         self._active: bool = False
 
+        # Flush config -- read from Hermes memory block at initialize() time.
+        self._flush_min_turns: int = self._DEFAULT_FLUSH_MIN_TURNS
+
+        # Current session ID assigned at initialize() -- used as the episode key.
+        self._session_id: str = ""
+
+        # Turn buffer: list of {"role": "user"|"assistant", "content": str}
+        self._turn_buffer: List[Dict[str, str]] = []
+        self._turn_buffer_lock = threading.Lock()
+        self._turns_since_flush: int = 0
+
         # Lazy-loaded RecallEngine (BGE model load is ~2s -- defer to first query)
-        self._engine: Optional[Any] = None  # episodic_memory.RecallEngine
+        self._engine: Optional[Any] = None
         self._engine_lock = threading.Lock()
 
-        # Prefetch cache: queue_prefetch → prefetch
+        # Lazy-loaded write-side objects (EpisodicMemoryStore + EpisodicEncoder).
+        # These are only needed for flushing, not for recall.
+        self._store: Optional[Any] = None      # episodic_memory.EpisodicMemoryStore
+        self._encoder: Optional[Any] = None    # episodic_memory.EpisodicEncoder
+        self._write_lock = threading.Lock()
+
+        # Background thread pool: prefetch + flush
         self._prefetch_result: str = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
+        self._flush_thread: Optional[threading.Thread] = None
 
     # -- Identity ------------------------------------------------------------
 
@@ -136,11 +166,17 @@ class EpisodicMemoryProvider(MemoryProvider):
             hermes_home = kwargs.get("hermes_home") or str(Path.home() / ".hermes")
             config: Dict[str, Any] = kwargs.get("config", {}) or {}
 
-            # Determine store path: explicit config → $HERMES_HOME/episodic_memory/<agent>
+            # Hermes passes flush_min_turns at the top-level memory config block.
+            # Fall back to our own default if not provided.
+            mem_config: Dict[str, Any] = kwargs.get("memory_config", {}) or {}
+            self._flush_min_turns = int(
+                mem_config.get("flush_min_turns", config.get("flush_min_turns", self._DEFAULT_FLUSH_MIN_TURNS))
+            )
+
+            # Determine store path: explicit config -> $HERMES_HOME/episodic_memory/<agent>
             if config.get("store_path"):
                 self._store_path = Path(config["store_path"]).expanduser().resolve()
             else:
-                # Derive agent name from profile name (hermes_home ends in profiles/<name>)
                 agent_name = config.get("agent_name") or Path(hermes_home).name
                 self._store_path = Path(hermes_home) / "episodic_memory" / agent_name
 
@@ -148,24 +184,32 @@ class EpisodicMemoryProvider(MemoryProvider):
             self._recall_threshold = float(config.get("recall_threshold", self._recall_threshold))
             self._filter_roleplay = bool(config.get("filter_roleplay", self._filter_roleplay))
 
-            # Verify store exists (db + hot tier)
+            # Store the session ID for episode keying.
+            self._session_id = session_id or str(uuid.uuid4())
+
+            # Ensure store directory exists (we create episodes on flush).
+            self._store_path.mkdir(parents=True, exist_ok=True)
+
+            # Mark active if recall store exists OR we can create it (i.e. dir is writable).
             db_path = self._store_path / "episodes.db"
             hot_path = self._store_path / "hot_metadata.json"
+            store_ready = db_path.exists() and hot_path.exists()
 
-            if not db_path.exists() or not hot_path.exists():
-                logger.warning(
-                    "Episodic memory store incomplete at %s "
-                    "(expected episodes.db + hot_metadata.json) -- provider inactive. "
-                    "Run encode_*_memories.py to build the store.",
-                    self._store_path,
+            self._active = True  # Always active once store dir is available.
+
+            if store_ready:
+                logger.info(
+                    "Episodic memory provider active (recall+encode): store=%s, model=%s, "
+                    "threshold=%.2f, flush_min_turns=%d",
+                    self._store_path, self._embedding_model, self._recall_threshold,
+                    self._flush_min_turns,
                 )
-                return
-
-            self._active = True
-            logger.info(
-                "Episodic memory provider active: store=%s, model=%s, threshold=%.2f",
-                self._store_path, self._embedding_model, self._recall_threshold,
-            )
+            else:
+                logger.info(
+                    "Episodic memory provider active (encode-only, store empty): store=%s -- "
+                    "recall will activate after first flush. flush_min_turns=%d",
+                    self._store_path, self._flush_min_turns,
+                )
 
         except Exception as e:
             logger.warning("Episodic memory provider init failed: %s", e)
@@ -175,7 +219,12 @@ class EpisodicMemoryProvider(MemoryProvider):
             return ""
         engine = self._get_engine()
         if engine is None:
-            return ""
+            # Store is empty / not yet built -- still worth mentioning encode is live.
+            return (
+                "# Episodic Memory\n"
+                "Active (encode-only). No episodes indexed yet -- "
+                "memories will accumulate as the session progresses."
+            )
         return (
             f"# Episodic Memory\n"
             f"Active. {engine.n_episodes} episodes indexed. "
@@ -189,7 +238,6 @@ class EpisodicMemoryProvider(MemoryProvider):
         """Return pre-warmed recall result from the last queue_prefetch call."""
         if not self._active:
             return ""
-        # Wait briefly for background thread if still running
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=2.0)
         with self._prefetch_lock:
@@ -206,7 +254,7 @@ class EpisodicMemoryProvider(MemoryProvider):
 
         engine = self._get_engine()
         if engine is None:
-            return
+            return  # Store not yet built -- skip silently.
 
         def _run():
             try:
@@ -217,7 +265,6 @@ class EpisodicMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Episodic prefetch failed: %s", e)
 
-        # Wait for previous prefetch to finish before starting a new one
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=1.0)
 
@@ -229,12 +276,35 @@ class EpisodicMemoryProvider(MemoryProvider):
     def sync_turn(
         self, user_content: str, assistant_content: str, *, session_id: str = ""
     ) -> None:
-        """No-op -- episodic store is built offline via encode_*_memories.py."""
-        pass
+        """Buffer this turn; flush to store when flush_min_turns is reached."""
+        if not self._active:
+            return
+
+        with self._turn_buffer_lock:
+            if user_content:
+                self._turn_buffer.append({"role": "user", "content": user_content})
+            if assistant_content:
+                self._turn_buffer.append({"role": "assistant", "content": assistant_content})
+            self._turns_since_flush += 1
+            should_flush = (
+                self._flush_min_turns > 0
+                and self._turns_since_flush >= self._flush_min_turns
+            )
+
+        if should_flush:
+            self._trigger_flush(force=False)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """No-op -- sessions are encoded in batch, not streamed live."""
-        pass
+        """Force-flush any remaining buffered turns and wait for completion."""
+        if not self._active:
+            return
+        # Wait for any in-progress flush to complete first.
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=30.0)
+        # Flush remaining buffer (may be < flush_min_turns -- flush anyway).
+        self._trigger_flush(force=True)
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=60.0)
 
     # -- Tools ---------------------------------------------------------------
 
@@ -253,7 +323,10 @@ class EpisodicMemoryProvider(MemoryProvider):
 
         engine = self._get_engine()
         if engine is None:
-            return json.dumps({"error": "Episodic memory engine not available"})
+            return json.dumps({
+                "result": "Episodic memory store is empty -- no episodes indexed yet.",
+                "similarity": 0.0,
+            })
 
         try:
             result = engine.query(query[:400])
@@ -279,8 +352,7 @@ class EpisodicMemoryProvider(MemoryProvider):
             {
                 "key": "store_path",
                 "description": (
-                    "Path to the episodic memory store directory "
-                    "(must contain episodes.db + hot_metadata.json). "
+                    "Path to the episodic memory store directory. "
                     "Leave blank to use $HERMES_HOME/episodic_memory/<profile_name>/"
                 ),
                 "required": False,
@@ -291,11 +363,19 @@ class EpisodicMemoryProvider(MemoryProvider):
                 "description": (
                     "BGE model name or absolute local path. "
                     "Default: BAAI/bge-large-en-v1.5. "
-                    "Use a local path (e.g. /models/huggingface/hub/models--BAAI--bge-large-en-v1.5) "
-                    "to avoid network fetches."
+                    "Use a local path to avoid network fetches."
                 ),
                 "required": False,
                 "default": "BAAI/bge-large-en-v1.5",
+            },
+            {
+                "key": "flush_min_turns",
+                "description": (
+                    "Number of turns to buffer before encoding to the episodic store. "
+                    "Set to 0 to disable live encoding (read-only mode). Default: 6."
+                ),
+                "required": False,
+                "default": 6,
             },
         ]
 
@@ -309,8 +389,151 @@ class EpisodicMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=30.0)
 
-    # -- Internal ------------------------------------------------------------
+    # -- Internal: flush pipeline --------------------------------------------
+
+    def _trigger_flush(self, force: bool = False) -> None:
+        """Snapshot current buffer and schedule a background encode+store."""
+        with self._turn_buffer_lock:
+            if not self._turn_buffer:
+                return
+            # If not forcing, check threshold again under lock.
+            if not force and self._turns_since_flush < self._flush_min_turns:
+                return
+            snapshot = list(self._turn_buffer)
+            self._turn_buffer.clear()
+            self._turns_since_flush = 0
+
+        if not snapshot:
+            return
+
+        session_id = self._session_id
+        store_path = self._store_path
+
+        def _run():
+            try:
+                self._encode_and_store(snapshot, session_id, store_path)
+            except Exception as e:
+                logger.warning("Episodic flush failed: %s", e, exc_info=True)
+
+        # Don't pile up flush threads -- wait for previous one first.
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=30.0)
+
+        self._flush_thread = threading.Thread(
+            target=_run, daemon=True, name="episodic-flush"
+        )
+        self._flush_thread.start()
+
+    def _encode_and_store(
+        self,
+        turns: List[Dict[str, str]],
+        session_id: str,
+        store_path: Path,
+    ) -> None:
+        """Embed turns with BGE, encode with EpisodicEncoder, write to store.
+
+        This runs in a background thread -- never call from the main agent loop.
+        """
+        import numpy as np
+
+        # Separate user and assistant turns.
+        user_turns = [t["content"] for t in turns if t["role"] == "user"]
+        agent_turns = [t["content"] for t in turns if t["role"] == "assistant"]
+
+        if not user_turns:
+            logger.debug("Episodic flush: no user turns to encode, skipping.")
+            return
+
+        # Pad so both lists are the same length (encoder expects paired turns).
+        max_t = max(len(user_turns), len(agent_turns))
+        user_turns += [""] * (max_t - len(user_turns))
+        agent_turns += [""] * (max_t - len(agent_turns))
+
+        embed_client = self._get_embed_client()
+        if embed_client is None:
+            logger.warning("Episodic flush: embed client unavailable, skipping.")
+            return
+
+        # Embed all turns in two batches (one shot each, no for-loop).
+        user_embs = embed_client.embed(user_turns)    # (T, D)
+        agent_embs = embed_client.embed(agent_turns)  # (T, D)
+
+        # If embeddings are 1024-dim (bge-small), pad to 1536 to match encoder input_dim.
+        target_dim = 1536
+        if user_embs.shape[1] < target_dim:
+            pad = target_dim - user_embs.shape[1]
+            user_embs = np.pad(user_embs, ((0, 0), (0, pad)))
+            agent_embs = np.pad(agent_embs, ((0, 0), (0, pad)))
+        elif user_embs.shape[1] > target_dim:
+            user_embs = user_embs[:, :target_dim]
+            agent_embs = agent_embs[:, :target_dim]
+
+        encoder = self._get_encoder()
+        if encoder is None:
+            logger.warning("Episodic flush: encoder unavailable, skipping.")
+            return
+
+        latent, coherence = encoder.encode_numpy(
+            user_embs.astype(np.float32),
+            agent_embs.astype(np.float32),
+        )
+
+        # Build a compact plain-text summary (no LLM needed).
+        summary = self._make_summary(turns)
+
+        store = self._get_store(store_path)
+        if store is None:
+            logger.warning("Episodic flush: store unavailable, skipping.")
+            return
+
+        with self._write_lock:
+            store.add(
+                session_id=session_id,
+                latent=latent,
+                transcript=turns,
+                metadata={
+                    "turn_count": len(turns),
+                    "coherence": float(coherence) if coherence is not None else None,
+                    "flush_partial": True,  # flagged as a within-session flush
+                    # emotion_cats required by resonance.py for blend computation.
+                    # Zeros = neutral; a future encoder upgrade can populate real values.
+                    "emotion_cats": [0.0] * 8,
+                    "dominant_emotion": "neutral",
+                    "dominant_archetype": "companion",
+                },
+                summary=summary,
+            )
+
+        # Invalidate the recall engine so it reloads with new episode next query.
+        with self._engine_lock:
+            self._engine = None
+
+        logger.info(
+            "Episodic flush: stored %d turns for session %s (coherence=%.3f)",
+            len(turns), session_id, float(coherence) if coherence is not None else -1,
+        )
+
+    @staticmethod
+    def _make_summary(turns: List[Dict[str, str]], max_chars: int = 800) -> str:
+        """Build a compact plain-text digest without an LLM call.
+
+        Format: interleaved "U: ..." / "A: ..." lines, truncated to max_chars.
+        """
+        lines = []
+        prefix_map = {"user": "U", "assistant": "A"}
+        for t in turns:
+            role = prefix_map.get(t["role"], t["role"][0].upper())
+            snippet = t["content"].strip().replace("\n", " ")[:160]
+            lines.append(f"{role}: {snippet}")
+        digest = "\n".join(lines)
+        if len(digest) > max_chars:
+            digest = digest[:max_chars].rsplit("\n", 1)[0] + "\n[...]"
+        return digest
+
+    # -- Internal: lazy-loaded objects ---------------------------------------
 
     def _get_engine(self) -> Optional[Any]:
         """Lazy-load RecallEngine (BGE model load ~2s, done once)."""
@@ -318,6 +541,12 @@ class EpisodicMemoryProvider(MemoryProvider):
             return self._engine
         if not self._active or self._store_path is None:
             return None
+
+        # Only load if store files actually exist.
+        db_path = self._store_path / "episodes.db"
+        hot_path = self._store_path / "hot_metadata.json"
+        if not db_path.exists() or not hot_path.exists():
+            return None  # Store not yet initialised by first flush.
 
         with self._engine_lock:
             if self._engine is not None:
@@ -328,7 +557,7 @@ class EpisodicMemoryProvider(MemoryProvider):
                     store_path=str(self._store_path),
                     recall_threshold=self._recall_threshold,
                     filter_roleplay=self._filter_roleplay,
-                    embedding_device="cpu",  # don't compete with main LLM for VRAM
+                    embedding_device="cpu",
                     embedding_model=self._embedding_model,
                 )
                 logger.info(
@@ -340,6 +569,66 @@ class EpisodicMemoryProvider(MemoryProvider):
                 self._engine = None
 
         return self._engine
+
+    def _get_embed_client(self) -> Optional[Any]:
+        """Return the embed client from the RecallEngine (reuses loaded model).
+
+        Falls back to constructing a minimal SentenceTransformer wrapper if
+        the engine isn't available yet (e.g. store is empty).
+        """
+        engine = self._get_engine()
+        if engine is not None:
+            try:
+                return engine._get_embed_client()
+            except Exception:
+                pass
+
+        # Standalone fallback (first flush before store exists).
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            class _STClient:
+                def __init__(self, model_name: str):
+                    self._st = SentenceTransformer(model_name, device="cpu")
+
+                def embed(self, texts):
+                    return self._st.encode(
+                        texts,
+                        batch_size=32,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
+
+                def embed_one(self, text: str):
+                    return self.embed([text])[0]
+
+            return _STClient(self._embedding_model)
+        except Exception as e:
+            logger.warning("Could not build standalone embed client: %s", e)
+            return None
+
+    def _get_encoder(self) -> Optional[Any]:
+        """Lazy-load EpisodicEncoder with default config (no custom checkpoint needed)."""
+        if self._encoder is not None:
+            return self._encoder
+        try:
+            from episodic_memory import EpisodicEncoder, EpisodicEncoderConfig
+            cfg = EpisodicEncoderConfig()
+            self._encoder = EpisodicEncoder(cfg).eval()
+        except Exception as e:
+            logger.warning("EpisodicEncoder init failed: %s", e)
+        return self._encoder
+
+    def _get_store(self, store_path: Path) -> Optional[Any]:
+        """Lazy-load EpisodicMemoryStore (creates db + hot tier if absent)."""
+        if self._store is not None:
+            return self._store
+        try:
+            from episodic_memory import EpisodicMemoryStore
+            self._store = EpisodicMemoryStore(store_path)
+        except Exception as e:
+            logger.warning("EpisodicMemoryStore init failed: %s", e)
+        return self._store
 
 
 # ---------------------------------------------------------------------------
