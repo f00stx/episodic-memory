@@ -273,11 +273,30 @@ class EpisodicMemoryProvider(MemoryProvider):
         )
         self._prefetch_thread.start()
 
+    # Hermes-internal scaffolding prefixes that should never be stored as
+    # episodic content.  These are compression prompts, context-compaction
+    # markers, and summarisation instructions injected by the framework itself.
+    _SYSTEM_TURN_PREFIXES: tuple = (
+        "Review the conversation above and consider saving",
+        "Please summarize the conversation",
+        "[CONTEXT COMPACTION",
+        "Conversation summary:",
+    )
+
     def sync_turn(
         self, user_content: str, assistant_content: str, *, session_id: str = ""
     ) -> None:
         """Buffer this turn; flush to store when flush_min_turns is reached."""
         if not self._active:
+            return
+
+        # Drop Hermes compression/summarisation scaffold turns -- they are
+        # internal framework messages, not real conversation content, and will
+        # corrupt episode summaries if stored.
+        if user_content and any(
+            user_content.startswith(p) for p in self._SYSTEM_TURN_PREFIXES
+        ):
+            logger.debug("sync_turn: skipping system scaffold turn")
             return
 
         with self._turn_buffer_lock:
