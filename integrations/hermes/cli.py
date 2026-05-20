@@ -4,10 +4,10 @@ Registered as: hermes episodic-memory <subcommand>
 Only active when episodic_memory is the configured memory provider.
 
 Subcommands:
-    status      -- show store health, episode count, last recall
-    stats       -- emotion/archetype distribution, roleplay ratio
-    search <q>  -- query the store and print the top result
-    path        -- print the resolved store path
+    status      — show store health, episode count, last recall
+    stats       — emotion/archetype distribution, roleplay ratio
+    search <q>  — query the store and print the top result
+    path        — print the resolved store path
 """
 
 from __future__ import annotations
