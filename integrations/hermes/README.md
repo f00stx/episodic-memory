@@ -11,24 +11,61 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) memory provider p
 
 ## Install
 
-### 1. Install the episodic-memory library into your Hermes venv
+### 1. Clone the repo
 
 ```bash
-uv pip install git+https://github.com/f00stx/episodic-memory
+git clone https://github.com/f00stx/episodic-memory
+cd episodic-memory
 ```
 
-> **Important:** Hermes uses a `uv`-managed venv. Use `uv pip install`, not `pip install` - the latter will fail with "externally managed environment".
-
-Verify:
-```bash
-~/.hermes/hermes-agent/venv/bin/python -c "from episodic_memory import RecallEngine; print('OK')"
-```
-
-### 2. Copy the plugin into Hermes
+### 2. Run the unified install script
 
 ```bash
-cp -r integrations/hermes ~/.hermes/hermes-agent/plugins/memory/episodic_memory
+# Usage: ./scripts/install.sh <profile_path>
+# Example:
+./scripts/install.sh ~/.hermes/profiles/myprofile
 ```
+
+This script:
+- Installs the library (`uv pip install --force-reinstall`)
+- Copies the plugin integration file into `~/.hermes/hermes-agent/plugins/`
+- Creates a symlink in your profile's plugins dir
+- Removes stale `.pyc` files
+
+### 3. Download the BGE embedding model
+
+```bash
+# Downloads bge-small-en-v1.5 (133MB)
+python scripts/download_model.py --small
+
+# Or download bge-large-en-v1.5 (2.5GB)
+python scripts/download_model.py --large
+```
+
+> **Note:** You can set `embedding_model: BAAI/bge-small-en-v1.5` in `config.yaml` to use the smaller model.
+
+### 4. Patch `run_agent.py` (one-time)
+
+```bash
+# Path to your Hermes Agent installation
+python scripts/patch_run_agent.py ~/.hermes/hermes-agent
+```
+
+This makes sure your config settings are injected into the plugin. See below for details.
+
+### 5. Configure your profile (`~/.hermes/profiles/myprofile/config.yaml`)
+
+```yaml
+memory:
+  provider: episodic_memory
+  flush_min_turns: 6
+  episodic_memory:
+    store_path: ~/.ctm/memory/myprofile
+    embedding_model: BAAI/bge-small-en-v1.5
+    recall_threshold: 0.50
+```
+
+See [Configuration reference](#configuration-reference) for all options.
 
 ### 3. Build a memory store for your profile
 
