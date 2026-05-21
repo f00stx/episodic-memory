@@ -1,26 +1,26 @@
 from unittest.mock import Mock, patch
 
-import importlib.util
+# Import the plugin module directly by loading the file
 import sys
-from unittest.mock import Mock, patch
+from pathlib import Path
 
-# Add the integrations/hermes dir to sys.path
-sys.path.insert(0, "/home/richard/projects/episodic-memory/integrations/hermes")
-# Import the plugin module directly from the path
-def load_module_from_path(name: str, path: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load module {name} from {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+# Ensure the integrations/hermes dir is in sys.path
+sys.path.insert(0, str(Path("/home/richard/projects/episodic-memory/integrations/hermes").absolute()))
+import __init__ as hermes_plugin
 
-hermes_plugin = load_module_from_path("hermes_plugin", "/home/richard/projects/episodic-memory/integrations/hermes/__init__.py")
 
 def test_get_tool_schemas_when_inactive():
     """Confirm get_tool_schemas() returns non-empty list even when _active=False."""
-    with patch.object(hermes_plugin.EpisodicMemoryPlugin, '_active', False):
-        plugin = hermes_plugin.EpisodicMemoryPlugin(Mock(), None)
-        schemas = plugin.get_tool_schemas()
-        assert len(schemas) > 0, "get_tool_schemas() should return tools even when inactive"
-        assert schemas[0]['name'] in ['episodic_recall', 'episodic_search'], "Expected a known tool name"
+    provider = hermes_plugin.EpisodicMemoryProvider()
+    provider._active = False  # Manually deactivate
+    schemas = provider.get_tool_schemas()
+    assert len(schemas) > 0, "get_tool_schemas() should return schemas even when inactive"
+    assert schemas[0]["name"] == "episodic_recall", "Expected episodic_recall tool schema"
+
+def test_get_tool_schemas_when_active():
+    """Confirm get_tool_schemas() returns non-empty list when _active=True."""
+    provider = hermes_plugin.EpisodicMemoryProvider()
+    provider._active = True
+    schemas = provider.get_tool_schemas()
+    assert len(schemas) > 0, "get_tool_schemas() should return schemas when active"
+    assert schemas[0]["name"] == "episodic_recall", "Expected episodic_recall tool schema"
