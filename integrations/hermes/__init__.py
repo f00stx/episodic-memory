@@ -567,6 +567,16 @@ class EpisodicMemoryProvider(MemoryProvider):
         if not db_path.exists() or not hot_path.exists():
             return None  # Store not yet initialised by first flush.
 
+        # Self-diagnostic: if store_path is the fallback location, check run_agent.py patch
+        fallback_pattern = "/episodic_memory/" + (config.get("agent_name") or Path(hermes_home).name)
+        if str(self._store_path).endswith(fallback_pattern):
+            logger.warning(
+                "WARNING: store_path looks like the fallback default (%s)."
+                " If you set store_path explicitly in config.yaml and still see this," 
+                "run_agent.py needs patching. See: https://github.com/f00stx/episodic-memory/blob/main/integrations/hermes/README.md#patching-run_agentpy",
+                self._store_path
+            )
+
         with self._engine_lock:
             if self._engine is not None:
                 return self._engine
@@ -584,8 +594,9 @@ class EpisodicMemoryProvider(MemoryProvider):
                     self._engine.n_episodes,
                 )
             except Exception as e:
-                logger.warning("RecallEngine init failed: %s", e)
-                self._engine = None
+                logger.error("EpisodicMemoryError: BGE model '%s' not found in HF cache.\nRun: python -c \"from huggingface_hub import snapshot_download; snapshot_download('%s')\"\nOr set embedding_model: BAAI/bge-small-en-v1.5 in config for a smaller download (133MB).",
+                             self._embedding_model, self._embedding_model)
+                raise
 
         return self._engine
 

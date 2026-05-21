@@ -394,9 +394,22 @@ class EpisodicMemoryStore:
     # ── Properties ─────────────────────────────────────────────────────────────
 
     @property
-    def n_episodes(self) -> int:
+    def    n_episodes(self) -> int:
         """Number of stored (non-removed) episodes."""
         return sum(1 for m in self._hot_metadata if not m.get("_removed", False))
+
+    def iterate_episodes(self):
+        """Yield full episode records (with metadata and summary). """
+        for sid in self.session_ids:
+            meta = self._hot_metadata[self._session_index[sid]]
+            transcript = self.fetch_transcript(sid)
+            summary = self.fetch_summary(sid)
+            yield {
+                "key": sid,
+                "metadata": meta,
+                "transcript": transcript,
+                "summary": summary or "",
+            }
 
     @property
     def session_ids(self) -> list[str]:
