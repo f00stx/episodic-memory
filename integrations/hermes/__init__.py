@@ -569,18 +569,15 @@ class EpisodicMemoryProvider(MemoryProvider):
         if not db_path.exists() or not hot_path.exists():
             return None  # Store not yet initialised by first flush.
 
-        # Self-diagnostic: if store_path is the fallback location, check run_agent.py patch
+        # Self-diagnostic: if store_path is the fallback location, warn about run_agent.py patch
         if self._store_path is not None:
-            # Extract agent_name from config or hermes_home
-            hermes_home = kwargs.get("hermes_home") or str(Path.home() / ".hermes")
-            config: Dict[str, Any] = kwargs.get("config", {}) or {}
-            agent_name = config.get("agent_name") or Path(hermes_home).name
+            agent_name = self._store_path.name
             fallback_pattern = f"/episodic_memory/{agent_name}"
             if str(self._store_path).endswith(fallback_pattern):
                 logger.warning(
                     "WARNING: store_path looks like the fallback default (%s)."
-                    " If you set store_path explicitly in config.yaml and still see this," 
-                    "run_agent.py needs patching. See: https://github.com/f00stx/episodic-memory/blob/main/integrations/hermes/README.md#patching-run_agentpy",
+                    " If you set store_path explicitly in config.yaml and still see this,"
+                    " run_agent.py needs patching. See: https://github.com/f00stx/episodic-memory/blob/main/integrations/hermes/README.md#patching-run_agentpy",
                     self._store_path
                 )
 
