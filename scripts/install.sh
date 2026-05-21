@@ -29,12 +29,15 @@ echo "Hermes root: $HERMES_DIR"
 echo "Virtual environment: $VENV_DIR"
 
 echo -n "1/4 Installing package... "
-if [ -d "$VENV_DIR" ]; then
-    # Linux/Mac with uv-managed venv
-    "$VENV_DIR/bin/uv" pip install --force-reinstall .
-else
+if [ ! -d "$VENV_DIR" ]; then
     echo "Error: Hermes venv not found at $VENV_DIR"
     exit 1
+fi
+# uv is a system binary, not inside the venv
+if command -v uv &>/dev/null; then
+    uv pip install --python "$VENV_DIR" --force-reinstall .
+else
+    "$VENV_DIR/bin/pip" install --force-reinstall .
 fi
 echo "OK"
 
