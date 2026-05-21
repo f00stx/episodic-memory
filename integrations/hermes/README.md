@@ -92,6 +92,8 @@ store.add(
 
 See the [episodic-memory README](https://github.com/f00stx/episodic-memory) for the full store API and Docker REST service.
 
+> **Note — the store starts empty.** On a fresh install, `episodes.db` has no entries and recall is a no-op. The plugin encodes sessions automatically as you use the agent (`flush_min_turns` controls how often — default 6 turns). After a handful of conversations the store will have enough content for recall to kick in. You can check progress at any time with `hermes episodic-memory status`. If you want to seed the store immediately from existing Hermes session history, see the store-builder example above.
+
 ### 4. Configure your profile
 
 In `~/.hermes/profiles/<your_profile>/config.yaml`:
