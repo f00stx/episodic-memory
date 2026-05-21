@@ -52,8 +52,36 @@ find "$PLUGIN_DIR" -name "__pycache__" -type d -exec rm -rf {} + || true
 echo "4/4 Creating plugin symlink..."
 PLUGIN_SYMLINK="$PROFILE_PATH/plugins/episodic_memory"
 mkdir -p "$(dirname "$PLUGIN_SYMLINK")"
+# Remove stale symlink or leftover dir before re-linking
+rm -f "$PLUGIN_SYMLINK"
 ln -sf "$PLUGIN_DIR" "$PLUGIN_SYMLINK"
 
+echo "5/5 Configuring profile..."
+CONFIG_FILE="$PROFILE_PATH/config.yaml"
+if [ -f "$CONFIG_FILE" ]; then
+    # Set memory.provider if it's blank or missing
+    if grep -q "^  provider: ''" "$CONFIG_FILE"; then
+        sed -i "s/^  provider: ''$/  provider: episodic_memory/" "$CONFIG_FILE"
+        echo "  Set memory.provider: episodic_memory in config.yaml"
+    elif ! grep -q "^  provider: episodic_memory" "$CONFIG_FILE"; then
+        echo "  NOTE: memory.provider not set — add this to config.yaml under memory:"
+        echo "    provider: episodic_memory"
+    else
+        echo "  memory.provider already set correctly."
+    fi
+    # Create store directory
+    STORE_PATH=$(grep "store_path:" "$CONFIG_FILE" | head -1 | awk '{print $2}' | sed "s|~|$HOME|g")
+    if [ -n "$STORE_PATH" ]; then
+        mkdir -p "$STORE_PATH"
+        echo "  Created store directory: $STORE_PATH"
+    fi
+else
+    echo "  NOTE: No config.yaml found at $CONFIG_FILE — set memory.provider: episodic_memory manually."
+fi
+
+echo ""
 echo "Installation complete for profile '$PROFILE_NAME'."
-echo "Run 'python scripts/download_model.py' to download the embedding model."
-echo "See README for config and run_agent.py patch instructions."
+echo "Next steps:"
+echo "  1. Run 'python scripts/download_model.py --small' to download the embedding model (if not already cached)"
+echo "  2. Run 'python scripts/patch_run_agent.py ~/.hermes/hermes-agent' (one-time, safe to re-run)"
+echo "  3. Restart the gateway: hermes gateway restart -p $PROFILE_NAME"
