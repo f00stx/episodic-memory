@@ -328,7 +328,9 @@ class EpisodicMemoryProvider(MemoryProvider):
     # -- Tools ---------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return ALL_TOOL_SCHEMAS if self._active else []
+        # Even when _active=False, return non-empty list to satisfy Hermes schema check
+        # The tool itself will no-op. This prevents schema drift in multi-agent workflows.
+        return ALL_TOOL_SCHEMAS # if self._active else []
 
     def handle_tool_call(
         self, tool_name: str, args: Dict[str, Any], **kwargs
@@ -568,14 +570,19 @@ class EpisodicMemoryProvider(MemoryProvider):
             return None  # Store not yet initialised by first flush.
 
         # Self-diagnostic: if store_path is the fallback location, check run_agent.py patch
-        fallback_pattern = "/episodic_memory/" + (config.get("agent_name") or Path(hermes_home).name)
-        if str(self._store_path).endswith(fallback_pattern):
-            logger.warning(
-                "WARNING: store_path looks like the fallback default (%s)."
-                " If you set store_path explicitly in config.yaml and still see this," 
-                "run_agent.py needs patching. See: https://github.com/f00stx/episodic-memory/blob/main/integrations/hermes/README.md#patching-run_agentpy",
-                self._store_path
-            )
+        if self._store_path is not None:
+            # Extract agent_name from config or hermes_home
+            hermes_home = kwargs.get("hermes_home") or str(Path.home() / ".hermes")
+            config: Dict[str, Any] = kwargs.get("config", {}) or {}
+            agent_name = config.get("agent_name") or Path(hermes_home).name
+            fallback_pattern = f"/episodic_memory/{agent_name}"
+            if str(self._store_path).endswith(fallback_pattern):
+                logger.warning(
+                    "WARNING: store_path looks like the fallback default (%s)."
+                    " If you set store_path explicitly in config.yaml and still see this," 
+                    "run_agent.py needs patching. See: https://github.com/f00stx/episodic-memory/blob/main/integrations/hermes/README.md#patching-run_agentpy",
+                    self._store_path
+                )
 
         with self._engine_lock:
             if self._engine is not None:
