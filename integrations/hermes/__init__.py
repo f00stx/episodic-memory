@@ -155,8 +155,15 @@ class EpisodicMemoryProvider(MemoryProvider):
         # Config: whether semantic trim is enabled (default True).
         self._semantic_trim_enabled: bool = True
 
+        # URL of the local LLM to use for semantic extraction.
+        # Defaults to qwen-reactions on port 8008. Override via config.
+        self._semantic_trim_llm_url: str = "http://localhost:8008/v1/chat/completions"
+
         # Global turn counter for this session (used to label semantic trim blocks).
         self._session_turn_index: int = 0
+
+        # Background thread for LLM-based semantic block generation.
+        self._trim_thread: Optional[threading.Thread] = None
 
     # -- Identity ------------------------------------------------------------
 
@@ -201,6 +208,9 @@ class EpisodicMemoryProvider(MemoryProvider):
             self._recall_threshold = float(config.get("recall_threshold", self._recall_threshold))
             self._filter_roleplay = bool(config.get("filter_roleplay", self._filter_roleplay))
             self._semantic_trim_enabled = bool(config.get("semantic_trim_enabled", True))
+            self._semantic_trim_llm_url = config.get(
+                "semantic_trim_llm_url", "http://localhost:8008/v1/chat/completions"
+            )
 
             # Store the session ID for episode keying.
             self._session_id = session_id or str(uuid.uuid4())
@@ -447,6 +457,8 @@ class EpisodicMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         if self._flush_thread and self._flush_thread.is_alive():
             self._flush_thread.join(timeout=30.0)
+        if self._trim_thread and self._trim_thread.is_alive():
+            self._trim_thread.join(timeout=10.0)
 
     # -- Internal: flush pipeline --------------------------------------------
 
@@ -465,26 +477,38 @@ class EpisodicMemoryProvider(MemoryProvider):
         if not snapshot:
             return
 
-        # --- Semantic trim (synchronous -- cheap, no LLM, no BGE) ---
-        # Build the state block from the snapshotted turns and stash it for
-        # the gateway to consume via pop_trim_pending() after run_conversation().
-        # We do this before launching the background encode thread so the block
-        # is available immediately after _trigger_flush() returns.
+        # --- Semantic trim (background thread -- LLM call to qwen-reactions) ---
+        # Build the state block asynchronously so the ~500ms LLM call doesn't
+        # block sync_turn() in the agent loop.  _trim_pending is populated when
+        # the thread completes; gateway polls pop_trim_pending() after
+        # run_conversation() returns (next turn at the earliest).
+        # Falls back to regex extraction if the LLM is unavailable.
         if self._semantic_trim_enabled and not force:
-            # Identify the last user/assistant messages for the carry-forward pair.
             last_user = next(
                 (t["content"] for t in reversed(snapshot) if t["role"] == "user"), ""
             )
             last_asst = next(
                 (t["content"] for t in reversed(snapshot) if t["role"] == "assistant"), ""
             )
-            try:
-                block = self._build_semantic_block(snapshot, self._session_turn_index)
+            turn_idx = self._session_turn_index
+            llm_url  = self._semantic_trim_llm_url
+
+            def _build_trim():
+                try:
+                    block = self._call_llm_for_semantic_block(snapshot, turn_idx, llm_url)
+                except Exception as e:
+                    logger.debug("LLM semantic extract failed, falling back to regex: %s", e)
+                    block = self._build_semantic_block(snapshot, turn_idx)
                 with self._trim_lock:
                     self._trim_pending = (block, last_user, last_asst)
                 logger.debug("Semantic trim block ready (%d chars)", len(block))
-            except Exception as e:
-                logger.debug("Semantic trim block generation failed (non-fatal): %s", e)
+
+            if self._trim_thread and self._trim_thread.is_alive():
+                self._trim_thread.join(timeout=8.0)  # wait for previous trim to finish
+            self._trim_thread = threading.Thread(
+                target=_build_trim, daemon=True, name="episodic-trim"
+            )
+            self._trim_thread.start()
 
         session_id = self._session_id
         store_path = self._store_path
@@ -609,6 +633,80 @@ class EpisodicMemoryProvider(MemoryProvider):
         if len(digest) > max_chars:
             digest = digest[:max_chars].rsplit("\n", 1)[0] + "\n[...]"
         return digest
+
+    @staticmethod
+    def _call_llm_for_semantic_block(
+        turns: List[Dict[str, str]],
+        turn_index: int,
+        llm_url: str,
+        timeout: float = 12.0,
+    ) -> str:
+        """Call a local LLM (qwen-reactions) to extract a structured state block.
+
+        Returns a [SEMANTIC_TRIM]-prefixed block in the same format as
+        _build_semantic_block().  Raises on any network/parse failure so
+        _trigger_flush() can fall back to regex.
+
+        Prompt is strict and output-constrained -- zero-temperature, max 350 tokens.
+        We ask for exactly the structure we need and validate the response contains
+        at least a TASK: line before accepting it.
+        """
+        import urllib.request
+
+        # Build a compact conversation excerpt -- truncate each turn to 300 chars
+        # to keep the prompt under ~2k tokens even for large turns.
+        excerpt_lines = []
+        for t in turns:
+            role = "U" if t["role"] == "user" else "A"
+            snippet = t["content"].strip().replace("\n", " ")[:300]
+            excerpt_lines.append(f"{role}: {snippet}")
+        excerpt = "\n".join(excerpt_lines)
+
+        system_prompt = (
+            "You are an operational state extractor for an AI coding assistant session. "
+            "Output ONLY the exact structured format below. "
+            "No prose, no markdown fences, no extra lines."
+        )
+        user_prompt = (
+            "Extract the current operational state from this conversation excerpt.\n\n"
+            "Output ONLY this exact format (omit a section entirely if empty):\n"
+            "TASK: <one line: what the user is currently trying to accomplish>\n"
+            "DECISIONS:\n"
+            "  - <concrete action taken or decision made, max 5 bullets>\n"
+            "PENDING:\n"
+            "  - <open, delegated, or follow-up item, max 3 bullets>\n"
+            "BLOCKERS:\n"
+            "  - <blocker that is STILL unresolved as of the final turn -- omit entire section if resolved or none>\n\n"
+            f"Conversation:\n{excerpt}"
+        )
+
+        payload = json.dumps({
+            "model": "qwen-reactions",
+            "max_tokens": 350,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+        }).encode()
+
+        req = urllib.request.Request(
+            llm_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode())
+
+        content = body["choices"][0]["message"]["content"].strip()
+
+        # Sanity check: must contain at least a TASK: line.
+        if "TASK:" not in content:
+            raise ValueError(f"LLM output missing TASK: line: {content[:120]!r}")
+
+        # Prepend the trim marker so sync_turn() filters it from re-encoding.
+        return f"[SEMANTIC_TRIM] turn={turn_index}\n{content}"
 
     @staticmethod
     def _build_semantic_block(
