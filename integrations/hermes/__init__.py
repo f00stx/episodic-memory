@@ -11,6 +11,10 @@ as a Hermes MemoryProvider.  Provides:
   * Live encoding -- turns buffered in sync_turn() and flushed to the store
     every ``flush_min_turns`` turns and at session end, matching Hermes memory
     management conventions (nudge_interval / flush_min_turns from config.yaml)
+  * Semantic trim -- every flush_min_turns turns, generates a compact no-bullshit
+    state block (TASK, DECISIONS, PENDING, TODO, PROCS) and signals the gateway
+    to rewrite the transcript to [state_block + last_turn_pair].  This keeps the
+    active context window flat without delegating summarisation to a lossy LLM.
 
 Store layout (agent-scoped, never shared):
     $HERMES_HOME/episodic_memory/<agent_name>/
@@ -41,12 +45,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
-import yaml
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -142,6 +147,17 @@ class EpisodicMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._flush_thread: Optional[threading.Thread] = None
 
+        # Semantic trim: populated at flush time, consumed by gateway via pop_trim_pending().
+        # Contains (semantic_block_str, last_user_msg, last_assistant_msg) or None.
+        self._trim_pending: Optional[Tuple[str, str, str]] = None
+        self._trim_lock = threading.Lock()
+
+        # Config: whether semantic trim is enabled (default True).
+        self._semantic_trim_enabled: bool = True
+
+        # Global turn counter for this session (used to label semantic trim blocks).
+        self._session_turn_index: int = 0
+
     # -- Identity ------------------------------------------------------------
 
     @property
@@ -167,10 +183,6 @@ class EpisodicMemoryProvider(MemoryProvider):
             hermes_home = kwargs.get("hermes_home") or str(Path.home() / ".hermes")
             config: Dict[str, Any] = kwargs.get("config", {}) or {}
 
-            # Add fallback to read config directly from profile when kwargs["config"] is empty
-            if not config:
-                config = self._read_profile_config(hermes_home)
-
             # Hermes passes flush_min_turns at the top-level memory config block.
             # Fall back to our own default if not provided.
             mem_config: Dict[str, Any] = kwargs.get("memory_config", {}) or {}
@@ -188,6 +200,7 @@ class EpisodicMemoryProvider(MemoryProvider):
             self._embedding_model = config.get("embedding_model", self._embedding_model)
             self._recall_threshold = float(config.get("recall_threshold", self._recall_threshold))
             self._filter_roleplay = bool(config.get("filter_roleplay", self._filter_roleplay))
+            self._semantic_trim_enabled = bool(config.get("semantic_trim_enabled", True))
 
             # Store the session ID for episode keying.
             self._session_id = session_id or str(uuid.uuid4())
@@ -219,25 +232,6 @@ class EpisodicMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Episodic memory provider init failed: %s", e)
 
-    def _read_profile_config(self, hermes_home: str) -> dict:
-        """Read the episodic_memory: sub-block directly from config.yaml.
-        
-        Used as fallback when Hermes hasn't been patched to inject config via kwargs.
-        Returns {} on any error so initialize() can fall through to defaults safely.
-        """
-        try:
-            import yaml
-            config_path = Path(hermes_home) / "config.yaml"
-            if not config_path.exists():
-                return {}
-            data = yaml.safe_load(config_path.read_text()) or {}
-            block = data.get("memory", {}).get("episodic_memory", {}) or {}
-            if block:
-                logger.debug("Reading episodic_memory config directly from %s", config_path)
-            return block
-        except Exception as e:
-            logger.debug("Could not read profile config: %s", e)
-            return {}
     def system_prompt_block(self) -> str:
         if not self._active:
             return ""
@@ -305,6 +299,7 @@ class EpisodicMemoryProvider(MemoryProvider):
         "Please summarize the conversation",
         "[CONTEXT COMPACTION",
         "Conversation summary:",
+        "[SEMANTIC_TRIM]",
     )
 
     def sync_turn(
@@ -329,6 +324,7 @@ class EpisodicMemoryProvider(MemoryProvider):
             if assistant_content:
                 self._turn_buffer.append({"role": "assistant", "content": assistant_content})
             self._turns_since_flush += 1
+            self._session_turn_index += 1
             should_flush = (
                 self._flush_min_turns > 0
                 and self._turns_since_flush >= self._flush_min_turns
@@ -336,6 +332,21 @@ class EpisodicMemoryProvider(MemoryProvider):
 
         if should_flush:
             self._trigger_flush(force=False)
+
+    def pop_trim_pending(self) -> Optional[Tuple[str, str, str]]:
+        """Consume and return a pending semantic trim if one is ready.
+
+        Returns (semantic_block, last_user_msg, last_assistant_msg) or None.
+        Called by the gateway after each run_conversation() to check whether
+        the transcript should be rewritten to a lean sliding window.
+
+        Thread-safe.  Idempotent -- returns None on subsequent calls until the
+        next flush cycle sets a new trim.
+        """
+        with self._trim_lock:
+            result = self._trim_pending
+            self._trim_pending = None
+        return result
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Force-flush any remaining buffered turns and wait for completion."""
@@ -453,6 +464,27 @@ class EpisodicMemoryProvider(MemoryProvider):
 
         if not snapshot:
             return
+
+        # --- Semantic trim (synchronous -- cheap, no LLM, no BGE) ---
+        # Build the state block from the snapshotted turns and stash it for
+        # the gateway to consume via pop_trim_pending() after run_conversation().
+        # We do this before launching the background encode thread so the block
+        # is available immediately after _trigger_flush() returns.
+        if self._semantic_trim_enabled and not force:
+            # Identify the last user/assistant messages for the carry-forward pair.
+            last_user = next(
+                (t["content"] for t in reversed(snapshot) if t["role"] == "user"), ""
+            )
+            last_asst = next(
+                (t["content"] for t in reversed(snapshot) if t["role"] == "assistant"), ""
+            )
+            try:
+                block = self._build_semantic_block(snapshot, self._session_turn_index)
+                with self._trim_lock:
+                    self._trim_pending = (block, last_user, last_asst)
+                logger.debug("Semantic trim block ready (%d chars)", len(block))
+            except Exception as e:
+                logger.debug("Semantic trim block generation failed (non-fatal): %s", e)
 
         session_id = self._session_id
         store_path = self._store_path
@@ -577,6 +609,132 @@ class EpisodicMemoryProvider(MemoryProvider):
         if len(digest) > max_chars:
             digest = digest[:max_chars].rsplit("\n", 1)[0] + "\n[...]"
         return digest
+
+    @staticmethod
+    def _build_semantic_block(
+        turns: List[Dict[str, str]],
+        turn_index: int,
+    ) -> str:
+        """Build a no-bullshit structured state block from buffered turns.
+
+        No LLM call.  Extracts:
+          TASK      -- most recent explicit task/goal statement
+          DECISIONS -- action lines from assistant turns (bullets, fixes, wired items)
+          PENDING   -- open items (LOOM/Forge tasks, unresolved questions)
+          TODO      -- active TODO items from the process-local TodoStore (best-effort)
+          PROCS     -- running background process IDs from process_registry (best-effort)
+
+        The block is prefixed with [SEMANTIC_TRIM] so episodic sync_turn()
+        filters it from re-encoding.
+        """
+        user_turns = [t["content"] for t in turns if t["role"] == "user"]
+        asst_turns = [t["content"] for t in turns if t["role"] == "assistant"]
+
+        # --- TASK: last user message summarised to one line ---
+        task_line = ""
+        if user_turns:
+            raw = user_turns[-1].strip().replace("\n", " ")
+            task_line = raw[:200] + ("..." if len(raw) > 200 else "")
+
+        # --- DECISIONS: extract bullet / action lines from assistant turns ---
+        decision_lines: List[str] = []
+        _action_re = re.compile(
+            r"^\s*[-*•]\s+(.+)|"           # markdown bullets
+            r"^\s*\d+\.\s+(.+)|"           # numbered list
+            r"\bFixed\b.+|"                 # "Fixed X"
+            r"\bWired\b.+|"                 # "Wired X"
+            r"\bAdded\b.+|"                 # "Added X"
+            r"\bPatched\b.+|"               # "Patched X"
+            r"\bRemoved\b.+",               # "Removed X"
+            re.IGNORECASE,
+        )
+        for txt in asst_turns[-2:]:         # only last 2 assistant turns
+            for line in txt.splitlines():
+                m = _action_re.match(line)
+                if m:
+                    content = (m.group(1) or m.group(2) or line).strip()
+                    if content and len(content) > 8:
+                        decision_lines.append(content[:120])
+                        if len(decision_lines) >= 5:
+                            break
+            if len(decision_lines) >= 5:
+                break
+
+        # --- PENDING: lines containing delegation/open signals ---
+        pending_lines: List[str] = []
+        _pending_re = re.compile(
+            r"LOOM|Forge|pending|TODO|TBD|next step|follow.up|still need|not yet",
+            re.IGNORECASE,
+        )
+        for txt in asst_turns[-2:]:
+            for line in txt.splitlines():
+                if _pending_re.search(line):
+                    clean = line.strip().lstrip("-*•0123456789. ").strip()
+                    if clean and len(clean) > 8:
+                        pending_lines.append(clean[:120])
+                        if len(pending_lines) >= 3:
+                            break
+            if len(pending_lines) >= 3:
+                break
+
+        # --- TODO: live TodoStore items (best-effort, no import error allowed) ---
+        todo_lines: List[str] = []
+        try:
+            from tools.todo_tool import TodoStore
+            ts = TodoStore()
+            formatted = ts.format_for_injection()
+            if formatted:
+                # Extract just the item lines (strip the header)
+                for line in formatted.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        todo_lines.append(line[:100])
+                        if len(todo_lines) >= 6:
+                            break
+        except Exception:
+            pass
+
+        # --- PROCS: running background processes (best-effort) ---
+        proc_lines: List[str] = []
+        try:
+            from tools.process_registry import process_registry
+            sessions = process_registry.list_sessions()
+            for s in sessions:
+                if s.get("status") == "running":
+                    cmd_snip = s.get("command", "")[:60]
+                    proc_lines.append(f"{s['session_id']} ({cmd_snip})")
+                    if len(proc_lines) >= 3:
+                        break
+        except Exception:
+            pass
+
+        # --- Assemble ---
+        lines = [f"[SEMANTIC_TRIM] turn={turn_index}"]
+        lines.append(f"TASK: {task_line}" if task_line else "TASK: (unknown)")
+
+        if decision_lines:
+            lines.append("DECISIONS:")
+            for d in decision_lines:
+                lines.append(f"  - {d}")
+
+        if pending_lines:
+            lines.append("PENDING:")
+            for p in pending_lines:
+                lines.append(f"  - {p}")
+
+        if todo_lines:
+            lines.append("TODO:")
+            for t in todo_lines:
+                lines.append(f"  {t}")
+
+        if proc_lines:
+            lines.append("PROCS:")
+            for p in proc_lines:
+                lines.append(f"  {p}")
+        else:
+            lines.append("PROCS: none")
+
+        return "\n".join(lines)
 
     # -- Internal: lazy-loaded objects ---------------------------------------
 
