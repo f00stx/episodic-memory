@@ -44,16 +44,7 @@ python scripts/download_model.py --large
 
 > **Note:** You can set `embedding_model: BAAI/bge-small-en-v1.5` in `config.yaml` to use the smaller model.
 
-### 4. Patch `run_agent.py` (one-time)
-
-```bash
-# Path to your Hermes Agent installation
-python scripts/patch_run_agent.py ~/.hermes/hermes-agent
-```
-
-This makes sure your config settings are injected into the plugin. See below for details.
-
-### 5. Configure your profile (`~/.hermes/profiles/myprofile/config.yaml`)
+### 4. Configure your profile (`~/.hermes/profiles/myprofile/config.yaml`)
 
 ```yaml
 memory:
@@ -67,7 +58,7 @@ memory:
 
 See [Configuration reference](#configuration-reference) for all options.
 
-### 3. Build a memory store for your profile
+### 5. Build a memory store for your profile
 
 The store is built offline from your past sessions. The episodic-memory library ships an `EpisodicMemoryStore` API - use it to encode past sessions into the store, or use the Docker REST service to build it programmatically.
 
@@ -94,7 +85,7 @@ See the [episodic-memory README](https://github.com/f00stx/episodic-memory) for 
 
 > **Note — the store starts empty.** On a fresh install, `episodes.db` has no entries and recall is a no-op. The plugin encodes sessions automatically as you use the agent (`flush_min_turns` controls how often — default 6 turns). After a handful of conversations the store will have enough content for recall to kick in. You can check progress at any time with `hermes episodic-memory status`. If you want to seed the store immediately from existing Hermes session history, see the store-builder example above.
 
-### 4. Configure your profile
+### 6. Verify
 
 In `~/.hermes/profiles/<your_profile>/config.yaml`:
 
@@ -114,7 +105,7 @@ Or use the setup wizard:
 hermes memory setup
 ```
 
-### 5. Verify
+### 7. Verify
 
 ```bash
 hermes episodic-memory status    # episode count + store health

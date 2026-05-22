@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import yaml
 import time
 import uuid
 from pathlib import Path
@@ -166,6 +167,10 @@ class EpisodicMemoryProvider(MemoryProvider):
             hermes_home = kwargs.get("hermes_home") or str(Path.home() / ".hermes")
             config: Dict[str, Any] = kwargs.get("config", {}) or {}
 
+            # Add fallback to read config directly from profile when kwargs["config"] is empty
+            if not config:
+                config = self._read_profile_config(hermes_home)
+
             # Hermes passes flush_min_turns at the top-level memory config block.
             # Fall back to our own default if not provided.
             mem_config: Dict[str, Any] = kwargs.get("memory_config", {}) or {}
@@ -214,6 +219,25 @@ class EpisodicMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Episodic memory provider init failed: %s", e)
 
+    def _read_profile_config(self, hermes_home: str) -> dict:
+        """Read the episodic_memory: sub-block directly from config.yaml.
+        
+        Used as fallback when Hermes hasn't been patched to inject config via kwargs.
+        Returns {} on any error so initialize() can fall through to defaults safely.
+        """
+        try:
+            import yaml
+            config_path = Path(hermes_home) / "config.yaml"
+            if not config_path.exists():
+                return {}
+            data = yaml.safe_load(config_path.read_text()) or {}
+            block = data.get("memory", {}).get("episodic_memory", {}) or {}
+            if block:
+                logger.debug("Reading episodic_memory config directly from %s", config_path)
+            return block
+        except Exception as e:
+            logger.debug("Could not read profile config: %s", e)
+            return {}
     def system_prompt_block(self) -> str:
         if not self._active:
             return ""
