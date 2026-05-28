@@ -33,10 +33,12 @@ Or via .mcp.json (project scope):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +56,13 @@ logger = logging.getLogger("episodic-memory-mcp")
 # Lazy imports -- defer heavy BGE model load until first tool call
 # ---------------------------------------------------------------------------
 _engine: Any = None
+
+# Path to the standalone ingest module (integrations/claude_code/ingest_sessions.py)
+_INTEGRATIONS_PATH = Path(__file__).parent / "integrations" / "claude_code"
+
+# Cached ingest deps -- loaded once on first ingest pass that has work
+_ingest_embed_client: Any = None
+_ingest_encoder: Any = None
 
 
 def _get_engine() -> Any:
@@ -337,15 +346,184 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 # ---------------------------------------------------------------------------
+# Passive session ingest (background task)
+# ---------------------------------------------------------------------------
+
+_ingest_lock = asyncio.Lock()
+
+
+def _sync_ingest_pass(
+    projects_dir: Path,
+    store_path: Path,
+    ledger_path: Path,
+    min_age_secs: int,
+    min_turns: int,
+    bge_model: str,
+) -> tuple[int, int, int]:
+    """
+    Scan for uningested Claude Code sessions and write them to the store.
+    Runs in a thread via asyncio.to_thread -- safe to block.
+    Returns (ingested, skipped, errors).
+    """
+    global _ingest_embed_client, _ingest_encoder
+
+    if str(_INTEGRATIONS_PATH) not in sys.path:
+        sys.path.insert(0, str(_INTEGRATIONS_PATH))
+
+    from ingest_sessions import IngestLedger, _infer_project, encode_and_store, parse_session
+
+    cutoff = time.time() - min_age_secs
+    jsonl_files = sorted(projects_dir.rglob("*.jsonl"))
+    ledger = IngestLedger(ledger_path)
+
+    pending = [
+        f for f in jsonl_files
+        if not ledger.has(f.stem) and f.stat().st_mtime < cutoff
+    ]
+
+    if not pending:
+        ledger.close()
+        return 0, 0, 0
+
+    # Lazy-load heavy deps on first pass that actually has work
+    if _ingest_embed_client is None:
+        logger.info("Ingest: loading BGE model %s...", bge_model)
+        try:
+            from sentence_transformers import SentenceTransformer
+            _st = SentenceTransformer(bge_model, device="cpu")
+
+            class _EmbedClient:
+                def embed(self, texts):
+                    return _st.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+            _ingest_embed_client = _EmbedClient()
+        except Exception as e:
+            logger.error("Ingest: failed to load BGE: %s; skipping pass", e)
+            ledger.close()
+            return 0, 0, 0
+
+    if _ingest_encoder is None:
+        try:
+            from episodic_memory import EpisodicEncoder, EpisodicEncoderConfig
+            _ingest_encoder = EpisodicEncoder(EpisodicEncoderConfig()).eval()
+        except Exception as e:
+            logger.error("Ingest: failed to load EpisodicEncoder: %s; skipping pass", e)
+            ledger.close()
+            return 0, 0, 0
+
+    try:
+        from episodic_memory import EpisodicMemoryStore
+        store = EpisodicMemoryStore(str(store_path))
+    except Exception as e:
+        logger.error("Ingest: failed to open store: %s; skipping pass", e)
+        ledger.close()
+        return 0, 0, 0
+
+    ingested = skipped = errors = 0
+    for f in pending:
+        sid, turns, stored_at = parse_session(f)
+        project = _infer_project(f)
+
+        if len(turns) < min_turns:
+            skipped += 1
+            ledger.mark(sid, f, len(turns))
+            continue
+
+        try:
+            ok = encode_and_store(
+                sid, turns, stored_at, project, store,
+                _ingest_embed_client, _ingest_encoder,
+            )
+            if ok:
+                ingested += 1
+            else:
+                skipped += 1
+            ledger.mark(sid, f, len(turns))
+        except Exception as e:
+            logger.error("Ingest: error on session %s: %s", sid[:8], e)
+            errors += 1
+
+    ledger.close()
+    return ingested, skipped, errors
+
+
+async def _ingest_loop() -> None:
+    """
+    Background coroutine: ingest new Claude Code sessions periodically.
+
+    Env vars:
+        EPISODIC_PROJECTS_PATH    Claude projects dir  (default: ~/.claude/projects)
+        EPISODIC_INGEST_MIN_AGE   Minutes idle before a session is considered done (default: 10)
+        EPISODIC_INGEST_INTERVAL  Seconds between passes (default: 1800)
+        EPISODIC_INGEST_MIN_TURNS Skip sessions shorter than N turns (default: 3)
+        EPISODIC_INGEST_BGE_MODEL BGE model name (default: BAAI/bge-large-en-v1.5)
+    """
+    projects_dir = Path(
+        os.environ.get("EPISODIC_PROJECTS_PATH", "~/.claude/projects")
+    ).expanduser()
+    store_path = Path(
+        os.environ.get("EPISODIC_MEMORY_STORE_PATH", "~/.ctm/memory")
+    ).expanduser()
+    min_age_mins = int(os.environ.get("EPISODIC_INGEST_MIN_AGE", "10"))
+    interval = int(os.environ.get("EPISODIC_INGEST_INTERVAL", "1800"))
+    min_turns = int(os.environ.get("EPISODIC_INGEST_MIN_TURNS", "3"))
+    bge_model = os.environ.get("EPISODIC_INGEST_BGE_MODEL", "BAAI/bge-large-en-v1.5")
+    ledger_path = store_path / "claude_ingested.db"
+    min_age_secs = min_age_mins * 60
+
+    if not _INTEGRATIONS_PATH.exists():
+        logger.warning(
+            "Ingest integrations path missing: %s -- passive ingest disabled",
+            _INTEGRATIONS_PATH,
+        )
+        return
+    if not projects_dir.exists():
+        logger.info(
+            "EPISODIC_PROJECTS_PATH %s not found -- passive ingest disabled",
+            projects_dir,
+        )
+        return
+
+    logger.info(
+        "Passive ingest loop started: projects=%s interval=%ds min_age=%dm",
+        projects_dir, interval, min_age_mins,
+    )
+
+    while True:
+        async with _ingest_lock:
+            try:
+                ingested, skipped, errors = await asyncio.to_thread(
+                    _sync_ingest_pass,
+                    projects_dir, store_path, ledger_path,
+                    min_age_secs, min_turns, bge_model,
+                )
+                if ingested or errors:
+                    logger.info(
+                        "Ingest pass complete: ingested=%d skipped=%d errors=%d",
+                        ingested, skipped, errors,
+                    )
+            except Exception as e:
+                logger.error("Ingest pass failed: %s", e)
+
+        await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
 async def main() -> None:
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options(),
-        )
+    ingest_task = asyncio.create_task(_ingest_loop())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream,
+                write_stream,
+                app.create_initialization_options(),
+            )
+    finally:
+        ingest_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ingest_task
 
 
 if __name__ == "__main__":
