@@ -37,10 +37,13 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 # ---------------------------------------------------------------------------
 # Logging: stderr only so stdio JSON-RPC isn't polluted
@@ -51,6 +54,236 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("episodic-memory-mcp")
+
+# ---------------------------------------------------------------------------
+# Event telemetry -- fire-and-forget JSONL + optional Redpanda/Kafka
+#
+# Events are appended to <store_path>/mcp_events.jsonl always.
+# If EPISODIC_KAFKA_BROKERS is set (e.g. "localhost:19092") and kafka-python
+# is installed, events are also produced to the Kafka topic EPISODIC_KAFKA_TOPIC
+# (default: "episodic-memory-events").  All errors are swallowed so telemetry
+# never blocks a tool call.
+# ---------------------------------------------------------------------------
+_event_log_path: Path | None = None
+_kafka_producer: Any = None
+_kafka_topic: str = ""
+_kafka_init_done: bool = False
+
+
+def _init_telemetry() -> None:
+    global _event_log_path, _kafka_producer, _kafka_topic, _kafka_init_done
+    if _kafka_init_done:
+        return
+    _kafka_init_done = True
+
+    store_path = Path(
+        os.environ.get("EPISODIC_MEMORY_STORE_PATH", "~/.ctm/memory")
+    ).expanduser()
+    _event_log_path = store_path / "mcp_events.jsonl"
+
+    brokers = os.environ.get("EPISODIC_KAFKA_BROKERS", "").strip()
+    if brokers:
+        _kafka_topic = os.environ.get("EPISODIC_KAFKA_TOPIC", "episodic-memory-events")
+        try:
+            from kafka import KafkaProducer  # type: ignore
+            _kafka_producer = KafkaProducer(
+                bootstrap_servers=brokers.split(","),
+                value_serializer=lambda v: json.dumps(v).encode(),
+                acks=0,
+                retries=0,
+                api_version=(2, 0, 0),   # skip auto-detection (prevents blocking on connect)
+                request_timeout_ms=2000,
+            )
+            logger.info("Kafka telemetry connected: brokers=%s topic=%s", brokers, _kafka_topic)
+        except Exception as exc:
+            logger.warning("Kafka telemetry unavailable (%s) -- file log only", exc)
+
+
+def _emit_event(event: dict) -> None:
+    """Append event to JSONL log and optionally produce to Kafka. Never raises."""
+    event.setdefault("ts", time.time())
+
+    # File write first -- always works, never blocks
+    store_path = os.environ.get("EPISODIC_MEMORY_STORE_PATH", "")
+    if store_path:
+        try:
+            path = Path(store_path).expanduser() / "mcp_events.jsonl"
+            with open(path, "a") as fh:
+                fh.write(json.dumps(event) + "\n")
+        except Exception:
+            pass
+
+    # Kafka init (may block briefly on first call -- bounded by socket_timeout_ms)
+    _init_telemetry()
+    if _kafka_producer is not None:
+        try:
+            _kafka_producer.send(_kafka_topic, event)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Claude Code session file helpers
+# ---------------------------------------------------------------------------
+
+def _extract_text_from_content(content: Any) -> str:
+    """Extract text from message.content (string or list of blocks)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return " ".join(parts)
+    return ""
+
+
+def _parse_claude_jsonl(filepath: Path) -> dict | None:
+    """
+    Parse a Claude Code JSONL session file.
+    Returns dict with: session_id, project_dir, messages (list of {role, content, ts}), timestamp
+    """
+    try:
+        messages = []
+        session_id = filepath.stem
+        project_dir = filepath.parent.name
+        first_ts = None
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = entry.get("type")
+                if msg_type not in ("user", "assistant"):
+                    continue
+
+                msg = entry.get("message", {})
+                content = _extract_text_from_content(msg.get("content"))
+                if not content.strip():
+                    continue
+
+                ts = entry.get("timestamp")
+                if first_ts is None and ts:
+                    first_ts = ts
+
+                messages.append({
+                    "role": msg_type,
+                    "content": content,
+                    "ts": ts,
+                })
+
+        if not messages:
+            return None
+
+        return {
+            "session_id": session_id,
+            "project_dir": project_dir,
+            "messages": messages,
+            "timestamp": first_ts,
+        }
+    except Exception as e:
+        logger.warning("Failed to parse session file %s: %s", filepath, e)
+        return None
+
+
+def _compress_conversation(messages: list[dict], max_chars: int = 6000) -> str:
+    """Build compressed conversation string, capped at max_chars."""
+    lines = []
+    total = 0
+    for msg in messages:
+        role = msg["role"]
+        # Truncate individual messages to 1500 chars
+        content = msg["content"][:1500]
+        line = f"[{role}]: {content}\n"
+        if total + len(line) > max_chars:
+            # Add truncated indicator
+            remaining = max_chars - total - 20
+            if remaining > 50:
+                lines.append(f"[{role}]: {content[:remaining]}... [truncated]\n")
+            else:
+                lines.append("\n[Conversation truncated due to length]\n")
+            break
+        lines.append(line)
+        total += len(line)
+    return "".join(lines)
+
+
+async def _call_llm_for_extraction(query: str, compressed_conversation: str) -> str:
+    """
+    Call local LLM to extract relevant facts from conversation.
+    Tries qwen-coder (8003) first, falls back to qwen-main (8001).
+    Returns LLM response, 'NOT_RELEVANT', or 'LLM_UNAVAILABLE'.
+    """
+    prompt = f"""Given the search query: "{query}"
+
+Extract any relevant facts or decisions from the following conversation.
+Be concise -- 3-6 sentences. If the conversation contains nothing relevant, respond
+with exactly: NOT_RELEVANT
+
+CRITICAL HALLUCINATION GUARD: Only extract identifiers, model numbers, version numbers,
+and technical specifications that appear VERBATIM in the provided text. If a specific
+value is not explicitly stated, omit it entirely rather than inferring or generating it.
+If you are uncertain about a specific value, tag it as [uncertain] rather than presenting
+it as fact.
+
+Conversation:
+{compressed_conversation}"""
+
+    endpoints = [
+        ("http://localhost:8003/v1/chat/completions", "qwen-coder"),
+        ("http://localhost:8001/v1/chat/completions", "qwen3-30b-a3b-q4_k_s.gguf"),
+    ]
+
+    for url, model in endpoints:
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                response = await client.post(
+                    url,
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 400,
+                        "temperature": 0.1,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                result = data["choices"][0]["message"]["content"].strip()
+                return result
+        except Exception as e:
+            logger.warning("LLM extraction failed at %s: %s", url, e)
+
+    return "LLM_UNAVAILABLE"
+
+
+def _find_session_file(session_id: str) -> Path | None:
+    """Search for {session_id}.jsonl across ~/.claude/projects/"""
+    projects_dir = Path("~/.claude/projects").expanduser()
+    if not projects_dir.exists():
+        return None
+    for jsonl_file in projects_dir.rglob("*.jsonl"):
+        if jsonl_file.stem == session_id:
+            return jsonl_file
+    return None
+
+
+def _keyword_score(text: str, query_terms: list[str]) -> int:
+    """Score session by how many query terms appear in it."""
+    text_lower = text.lower()
+    score = 0
+    for term in query_terms:
+        score += len(re.findall(rf'\b{re.escape(term)}\b', text_lower, re.IGNORECASE))
+    return score
+
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- defer heavy BGE model load until first tool call
@@ -205,12 +438,68 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="fetch_session_detail",
+            description=(
+                "Fetch and summarise the content of a specific Claude Code session file. "
+                "Use this when episodic_recall or search_sessions_raw returns a session_id "
+                "and you need the actual detailed content. Searches ~/.claude/projects/ "
+                "for the JSONL file and uses a local LLM to extract facts relevant to your query."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The Claude Code session UUID (e.g. '253ddbb5-f4dd-4a39-a28e-5e2d81a86e95')",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "What you are looking for in this session -- the LLM will extract facts relevant to this query.",
+                    },
+                },
+                "required": ["session_id", "query"],
+            },
+        ),
+        Tool(
+            name="search_sessions_raw",
+            description=(
+                "Fallback: keyword-scan all Claude Code session files in ~/.claude/projects/, "
+                "then use a local LLM to extract relevant content. Sequential, not parallel. "
+                "Use ONLY when episodic_recall and session_search return no useful hits. "
+                "Slower than episodic recall -- prefer episodic tools first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for across all Claude Code session files.",
+                    },
+                    "n_results": {
+                        "type": "integer",
+                        "description": "Maximum number of relevant results to return (default: 3).",
+                        "default": 3,
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     logger.debug("call_tool: %s args=%s", name, arguments)
+    _t0 = time.time()
+
+    # Emit tool-invocation event immediately (before execution)
+    _emit_event({
+        "event":     "mcp_tool_called",
+        "tool":      name,
+        "args_keys": sorted(arguments.keys()),
+        "query_len": len(arguments.get("text", "") or arguments.get("session_id", "")),
+    })
 
     try:
         if name == "memory_query":
@@ -221,7 +510,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 only_tags=arguments.get("only_tags"),
             )
             if result is None:
+                _emit_event({
+                    "event":       "memory_query_miss",
+                    "tool":        name,
+                    "elapsed_ms":  round((time.time() - _t0) * 1000, 1),
+                })
                 return [TextContent(type="text", text="null")]
+
+            _emit_event({
+                "event":            "memory_query_hit",
+                "tool":             name,
+                "session_id":       result.session_id,
+                "similarity":       round(result.similarity, 4),
+                "dominant_emotion": result.dominant_emotion,
+                "is_superseded":    result.is_superseded,
+                "elapsed_ms":       round((time.time() - _t0) * 1000, 1),
+            })
 
             payload = {
                 "session_id": result.session_id,
@@ -310,14 +614,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             limit = arguments.get("limit", 100)
             offset = arguments.get("offset", 0)
 
+            sorted_meta = sorted(
+                [m for m in store._hot_metadata if not m.get("_removed")],
+                key=lambda m: m.get("stored_at", 0.0),
+                reverse=True,
+            )
+
             items = []
-            for i, meta in enumerate(store._hot_metadata):
-                if meta.get("_removed"):
-                    continue
-                if i < offset:
-                    continue
-                if len(items) >= limit:
-                    break
+            for meta in sorted_meta[offset : offset + limit]:
                 items.append(
                     {
                         "session_id": meta.get("session_id", ""),
@@ -337,11 +641,247 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
+        elif name == "fetch_session_detail":
+            session_id = arguments["session_id"]
+            query = arguments["query"]
+
+            # Emit start event
+            _emit_event({
+                "event": "fetch_session_detail_start",
+                "tool": name,
+                "session_id": session_id,
+            })
+
+            # Find the session file
+            filepath = _find_session_file(session_id)
+            if filepath is None:
+                _emit_event({
+                    "event": "fetch_session_detail_not_found",
+                    "tool": name,
+                    "session_id": session_id,
+                    "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+                })
+                return [TextContent(type="text", text=json.dumps({
+                    "error": "session_file_missing",
+                    "note": "Index entry exists but source file is unavailable -- summary cannot be generated",
+                    "session_id": session_id,
+                }))]
+
+            # Parse the JSONL
+            session_data = _parse_claude_jsonl(filepath)
+            if session_data is None:
+                _emit_event({
+                    "event": "fetch_session_detail_parse_error",
+                    "tool": name,
+                    "session_id": session_id,
+                    "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+                })
+                return [TextContent(type="text", text=json.dumps({
+                    "error": f"Failed to parse session file: {filepath}",
+                    "session_id": session_id,
+                }))]
+
+            # Compress conversation and call LLM
+            compressed = _compress_conversation(session_data["messages"])
+            llm_result = await _call_llm_for_extraction(query, compressed)
+
+            _emit_event({
+                "event": "fetch_session_detail_complete",
+                "tool": name,
+                "session_id": session_id,
+                "llm_not_relevant": llm_result == "NOT_RELEVANT",
+                "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+            })
+
+            if llm_result == "NOT_RELEVANT":
+                return [TextContent(type="text", text=json.dumps({
+                    "session_id": session_id,
+                    "query": query,
+                    "result": "NOT_RELEVANT",
+                    "message": "The conversation does not contain content relevant to the query.",
+                }))]
+
+            # Parse approximate date from timestamp
+            approx_date = None
+            if session_data.get("timestamp"):
+                try:
+                    from datetime import datetime
+                    ts = session_data["timestamp"]
+                    if isinstance(ts, (int, float)):
+                        approx_date = datetime.fromtimestamp(ts).isoformat()
+                except Exception:
+                    pass
+
+            if llm_result == "LLM_UNAVAILABLE":
+                # Return raw excerpt so caller has something useful even without LLM
+                return [TextContent(type="text", text=json.dumps({
+                    "session_id": session_id,
+                    "approximate_date": approx_date,
+                    "project_dir": session_data["project_dir"],
+                    "summary": None,
+                    "llm_unavailable": True,
+                    "raw_excerpt": compressed[:3000],
+                }, indent=2))]
+
+            return [TextContent(type="text", text=json.dumps({
+                "session_id": session_id,
+                "approximate_date": approx_date,
+                "project_dir": session_data["project_dir"],
+                "summary": llm_result,
+            }, indent=2))]
+
+        elif name == "search_sessions_raw":
+            query = arguments["query"]
+            n_results = arguments.get("n_results", 3)
+            n_results = max(1, min(n_results, 10))  # Cap between 1-10
+
+            # Calculate candidate limit
+            candidate_limit = min(n_results * 3, 15)
+
+            # Emit start event
+            _emit_event({
+                "event": "search_sessions_raw_start",
+                "tool": name,
+                "query": query,
+                "n_results": n_results,
+            })
+
+            # Walk ~/.claude/projects/ for all JSONL files
+            projects_dir = Path("~/.claude/projects").expanduser()
+            if not projects_dir.exists():
+                _emit_event({
+                    "event": "search_sessions_raw_no_projects",
+                    "tool": name,
+                    "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+                })
+                return [TextContent(type="text", text=json.dumps({
+                    "error": "Claude projects directory not found: ~/.claude/projects/",
+                    "results": [],
+                }))]
+
+            # Parse all session files
+            jsonl_files = list(projects_dir.rglob("*.jsonl"))
+            if not jsonl_files:
+                _emit_event({
+                    "event": "search_sessions_raw_no_files",
+                    "tool": name,
+                    "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+                })
+                return [TextContent(type="text", text=json.dumps({
+                    "message": "No session files found in ~/.claude/projects/",
+                    "results": [],
+                }))]
+
+            # Tokenize query for keyword scoring
+            query_terms = [t.lower() for t in query.split() if len(t) >= 3]
+            if not query_terms:
+                # If all terms are short, use them anyway
+                query_terms = [t.lower() for t in query.split()]
+
+            # Score each session and build candidate list
+            scored_sessions = []
+            for filepath in jsonl_files:
+                session_data = _parse_claude_jsonl(filepath)
+                if session_data is None:
+                    continue
+
+                # Build full text for scoring
+                full_text = " ".join([m["content"] for m in session_data["messages"]])
+                score = _keyword_score(full_text, query_terms)
+
+                if score > 0:
+                    scored_sessions.append((score, session_data, filepath))
+
+            if not scored_sessions:
+                _emit_event({
+                    "event": "search_sessions_raw_no_matches",
+                    "tool": name,
+                    "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+                })
+                return [TextContent(type="text", text=json.dumps({
+                    "message": "No sessions matched the query keywords.",
+                    "results": [],
+                }))]
+
+            # Sort by score descending and take top candidates
+            scored_sessions.sort(key=lambda x: x[0], reverse=True)
+            candidates = scored_sessions[:candidate_limit]
+
+            # Process candidates sequentially with LLM
+            results = []
+            for score, session_data, filepath in candidates:
+                if len(results) >= n_results:
+                    break
+
+                compressed = _compress_conversation(session_data["messages"])
+                llm_result = await _call_llm_for_extraction(query, compressed)
+
+                if llm_result == "NOT_RELEVANT":
+                    continue
+
+                # Parse approximate date
+                approx_date = None
+                if session_data.get("timestamp"):
+                    try:
+                        from datetime import datetime
+                        ts = session_data["timestamp"]
+                        if isinstance(ts, (int, float)):
+                            approx_date = datetime.fromtimestamp(ts).isoformat()
+                    except Exception:
+                        pass
+
+                if llm_result == "LLM_UNAVAILABLE":
+                    # Include raw excerpt so caller has something useful
+                    results.append({
+                        "session_id": session_data["session_id"],
+                        "project_dir": session_data["project_dir"],
+                        "approximate_date": approx_date,
+                        "keyword_score": score,
+                        "summary": None,
+                        "llm_unavailable": True,
+                        "raw_excerpt": compressed[:2000],
+                    })
+                else:
+                    results.append({
+                        "session_id": session_data["session_id"],
+                        "project_dir": session_data["project_dir"],
+                        "approximate_date": approx_date,
+                        "keyword_score": score,
+                        "summary": llm_result,
+                    })
+
+            _emit_event({
+                "event": "search_sessions_raw_complete",
+                "tool": name,
+                "query": query,
+                "candidates_checked": len(candidates),
+                "results_found": len(results),
+                "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+            })
+
+            if not results:
+                return [TextContent(type="text", text=json.dumps({
+                    "message": f"Checked {len(candidates)} candidate sessions but found no relevant content after LLM analysis.",
+                    "query": query,
+                    "results": [],
+                }))]
+
+            return [TextContent(type="text", text=json.dumps({
+                "query": query,
+                "results": results,
+            }, indent=2))]
+
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
     except Exception as exc:
         logger.exception("Tool %s failed", name)
+        _emit_event({
+            "event":      "mcp_tool_error",
+            "tool":       name,
+            "error":      str(exc),
+            "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+        })
         return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
 
 
@@ -524,6 +1064,20 @@ async def main() -> None:
         ingest_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await ingest_task
+
+
+# Module-level startup probe -- fires the instant this file is loaded.
+# If this does NOT appear in mcp_events.jsonl, the subprocess is not running
+# this version of the file (wrong path, stale bytecode, or startup crash).
+_startup_store = os.environ.get("EPISODIC_MEMORY_STORE_PATH", "")
+if _startup_store:
+    try:
+        _startup_path = Path(_startup_store).expanduser() / "mcp_events.jsonl"
+        with open(_startup_path, "a") as _f:
+            _f.write(json.dumps({"event": "mcp_server_started", "ts": time.time(),
+                                  "pid": os.getpid(), "file": __file__}) + "\n")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
