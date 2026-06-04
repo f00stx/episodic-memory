@@ -141,11 +141,17 @@ class IngestLedger:
         """)
         self._conn.commit()
 
-    def has(self, session_id: str) -> bool:
+    def has(self, session_id: str, path: Path = None) -> bool:
         cur = self._conn.execute(
-            "SELECT 1 FROM ingested WHERE session_id = ?", (session_id,)
+            "SELECT ingested_at FROM ingested WHERE session_id = ?", (session_id,)
         )
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        if row is None:
+            return False
+        # Re-ingest if the file has been written to since last import (active session)
+        if path is not None and path.stat().st_mtime > row[0]:
+            return False
+        return True
 
     def mark(self, session_id: str, path: Path, turn_count: int) -> None:
         self._conn.execute(
@@ -300,7 +306,7 @@ def main():
     log.info("Ledger: %d sessions previously ingested", ledger.count())
 
     # Filter to uningested
-    pending = [f for f in jsonl_files if not ledger.has(f.stem)]
+    pending = [f for f in jsonl_files if not ledger.has(f.stem, f)]
     log.info("%d sessions pending ingestion", len(pending))
 
     if not pending:

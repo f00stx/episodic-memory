@@ -28,6 +28,7 @@ Design notes:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -47,6 +48,20 @@ try:
     from episodic_memory.graph import MemgraphClient as _MemgraphClient
 except ImportError:
     _MemgraphClient = None  # type: ignore
+
+
+def _emit_store_event(event: dict) -> None:
+    """Append to <store_path>/mcp_events.jsonl if reachable. Never raises."""
+    event.setdefault("ts", time.time())
+    log_path = os.environ.get("EPISODIC_MEMORY_STORE_PATH", "")
+    if not log_path:
+        return
+    try:
+        path = Path(log_path).expanduser() / "mcp_events.jsonl"
+        with open(path, "a") as fh:
+            fh.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
 
 
 class EpisodicMemoryStore:
@@ -186,6 +201,15 @@ class EpisodicMemoryStore:
             dominant_archetype = meta["dominant_archetype"],
         )
 
+        _emit_store_event({
+            "event":             "memory_stored",
+            "session_id":        session_id,
+            "turn_count":        meta["turn_count"],
+            "dominant_emotion":  meta["dominant_emotion"],
+            "project":           meta.get("project", ""),
+            "total_episodes":    len(self._hot_metadata),
+        })
+
         # ── Graph side-write (optional) ────────────────────────────────────────
         if self._graph is not None:
             try:
@@ -273,6 +297,15 @@ class EpisodicMemoryStore:
                 meta = dict(self._hot_metadata[idx])
                 sid  = meta.get("session_id", "")
                 results.append((sid, sim, meta))
+
+        if results:
+            _emit_store_event({
+                "event":          "memory_queried",
+                "n_candidates":   len(self._hot_metadata),
+                "n_results":      len(results),
+                "top_similarity": round(results[0][1], 4) if results else None,
+                "top_k":          top_k,
+            })
 
         return results
 

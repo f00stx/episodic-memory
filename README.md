@@ -209,6 +209,42 @@ A drop-in memory provider plugin for [Hermes Agent](https://github.com/NousResea
 
 See [`integrations/hermes/README.md`](integrations/hermes/README.md) for setup.
 
+## Known limitations
+
+These are architectural decisions with known tradeoffs, not bugs. Understanding them upfront saves a lot of head-scratching.
+
+### The affective summary discards technical facts
+
+`EpisodicRecall`'s LLM summary prompt is designed for *emotional and relational* context injection -- it explicitly instructs the model not to reproduce quotes or list facts. This is correct for the use case of priming an agent's "mood" and relational stance. It is the wrong tool if you need the agent to remember "we used `--limit 500` and got AUROC 0.6866 on the domain corpus."
+
+**Practical consequence:** Precise technical details (metric values, file paths, flag combinations, model checkpoint names, version numbers) do not survive the compression path. Only the emotional tone, relational mode, and broad thematic summary are retained.
+
+**Workarounds:**
+- Write precise facts to a separate project state file and load it explicitly at session start.
+- Use `fetch_session_detail` (MCP) or `memory_get` to pull the raw transcript for a specific session -- the transcript itself is stored verbatim in SQLite, only the *summary* is lossy.
+- Add a parallel "technical index" summarisation pass with a fact-preserving prompt -- the system doesn't do this out of the box.
+
+### LLM summary is generated lazily, not at ingest time
+
+Summaries are generated on first recall (when `recall_threshold` is crossed), not when the episode is first stored. This means:
+- First recall of any cold session adds 100-500ms LLM latency.
+- If the LLM endpoint is unavailable at recall time, the fallback summary is a bare metadata stub ("A 34-turn conversation from 2024-11-15. Dominant tone: trust.") -- no content.
+- Pre-generation is possible via `EpisodicRecall.precompute_summaries()`, but it is not automatic.
+
+### MCP server: LLM endpoint is not configurable via environment variable
+
+The MCP server (`mcp_server.py`) hardcodes `llm_base_url="http://localhost:11434/v1"` and `llm_model="llama3"` when constructing the `RecallEngine`. There is no env var to override these without editing the source file. If your Ollama instance is on a different host or port, or you want to use a different model, you need to edit `_get_engine()` directly.
+
+### Passive ingest delay
+
+The background ingest loop (`_ingest_loop` in `mcp_server.py`) only picks up a Claude Code session after it has been idle for 10 minutes AND the loop's 30-minute interval has elapsed. In the worst case, a session you just closed takes up to 40 minutes to become recallable. If you need immediate availability, run `ingest_sessions.py` manually.
+
+### Cosine similarity over summary embeddings, not full transcripts
+
+The hot-tier resonance search operates over BGE embeddings of the *summary text*, not the full transcript. This is what gives sub-5ms performance. It also means that a session only becomes searchable once it has a summary (see lazy generation above), and that the retrieval quality is bounded by summary quality.
+
+---
+
 ## License
 
 MIT
