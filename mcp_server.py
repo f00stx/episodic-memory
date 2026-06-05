@@ -1067,11 +1067,54 @@ async def _ingest_loop() -> None:
         await asyncio.sleep(interval)
 
 
+def _sync_precompute_pass() -> tuple[int, int]:
+    """
+    Runs in a thread. Precomputes missing affective summaries and technical
+    indexes for all episodes in the store. Returns (updated, skipped).
+    """
+    engine = _engine
+    if engine is None:
+        return 0, 0
+    generated = engine._get_recall().precompute_summaries(include_technical=True)
+    return len(generated), 0
+
+
+async def _precompute_loop() -> None:
+    """
+    Background coroutine: warm affective summaries and technical indexes for
+    episodes that don't have them yet.
+
+    Runs once at startup (after a short delay) then on a long interval so that
+    new ingest batches are covered without waiting for an explicit recall.
+
+    Env vars:
+        EPISODIC_PRECOMPUTE_STARTUP_DELAY  Seconds before first run (default: 60)
+        EPISODIC_PRECOMPUTE_INTERVAL       Seconds between runs (default: 21600)
+    """
+    startup_delay = int(os.environ.get("EPISODIC_PRECOMPUTE_STARTUP_DELAY", "60"))
+    interval      = int(os.environ.get("EPISODIC_PRECOMPUTE_INTERVAL", "21600"))
+
+    await asyncio.sleep(startup_delay)
+
+    while True:
+        try:
+            updated, _ = await asyncio.to_thread(_sync_precompute_pass)
+            if updated:
+                logger.info("Precompute pass: %d episodes updated", updated)
+            else:
+                logger.debug("Precompute pass: nothing to do")
+        except Exception as e:
+            logger.error("Precompute pass failed: %s", e)
+
+        await asyncio.sleep(interval)
+
+
 # ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
 async def main() -> None:
-    ingest_task = asyncio.create_task(_ingest_loop())
+    ingest_task     = asyncio.create_task(_ingest_loop())
+    precompute_task = asyncio.create_task(_precompute_loop())
     try:
         async with stdio_server() as (read_stream, write_stream):
             await app.run(
@@ -1081,8 +1124,11 @@ async def main() -> None:
             )
     finally:
         ingest_task.cancel()
+        precompute_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await ingest_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await precompute_task
 
 
 # Module-level startup probe -- fires the instant this file is loaded.

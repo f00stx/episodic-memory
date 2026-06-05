@@ -281,6 +281,10 @@ def parse_args():
     p.add_argument("--min-turns", type=int, default=3,             help="Skip sessions with fewer turns")
     p.add_argument("--dry-run",  action="store_true",              help="Parse without writing")
     p.add_argument("--verbose",  action="store_true",              help="Per-session logging")
+    p.add_argument("--precompute-summaries", action="store_true",
+                   help="After ingest, generate affective summaries and technical indexes "
+                        "for all episodes missing them. Uses EPISODIC_LLM_* and "
+                        "EPISODIC_TECHNICAL_LLM_* env vars for LLM endpoints.")
     return p.parse_args()
 
 
@@ -391,6 +395,25 @@ def main():
         ingested, skipped, errors, store.n_episodes,
     )
     ledger.close()
+
+    if args.precompute_summaries:
+        import os
+        log.info("Precomputing affective summaries and technical indexes...")
+        try:
+            from episodic_memory.recall import EpisodicRecall
+            recall = EpisodicRecall(
+                store=store,
+                llm_base_url=os.environ.get("EPISODIC_LLM_BASE_URL", "http://localhost:11434/v1"),
+                llm_model=os.environ.get("EPISODIC_LLM_MODEL", "llama3"),
+                llm_api_key=os.environ.get("EPISODIC_LLM_API_KEY", "none"),
+                technical_llm_base_url=os.environ.get("EPISODIC_TECHNICAL_LLM_BASE_URL", "http://localhost:8003/v1"),
+                technical_llm_model=os.environ.get("EPISODIC_TECHNICAL_LLM_MODEL", "qwen2.5-coder-32b-instruct"),
+                technical_llm_api_key=os.environ.get("EPISODIC_TECHNICAL_LLM_API_KEY", "none"),
+            )
+            generated = recall.precompute_summaries(include_technical=True)
+            log.info("Precompute complete: %d episodes updated", len(generated))
+        except Exception as e:
+            log.error("Precompute failed: %s", e)
 
 
 if __name__ == "__main__":

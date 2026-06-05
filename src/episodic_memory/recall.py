@@ -260,44 +260,69 @@ class EpisodicRecall:
 
     def precompute_summaries(
         self,
-        session_ids: Optional[list[str]] = None,
-        batch_size: int = 10,
-    ) -> dict[str, str]:
+        session_ids:       Optional[list[str]] = None,
+        batch_size:        int  = 10,
+        include_technical: bool = True,
+    ) -> dict[str, dict]:
         """
-        Pre-generate summaries for a batch of sessions (e.g. at store build time).
+        Pre-generate summaries (and optionally technical indexes) for sessions
+        that don't yet have them cached.
 
         Args:
-            session_ids: sessions to process. If None, processes ALL sessions
-                         that have no cached summary.
-            batch_size:  log progress every N sessions.
+            session_ids:       Sessions to process. If None, processes ALL sessions
+                               missing a summary.
+            batch_size:        Log progress every N sessions.
+            include_technical: Also generate technical indexes for sessions that
+                               don't have one. Default True.
 
         Returns:
-            dict mapping session_id → generated summary.
+            dict mapping session_id → {"summary": ..., "technical_index": ...}
+            for sessions where at least one field was newly generated.
         """
         if session_ids is None:
             session_ids = [
                 sid for sid in self.store.session_ids
                 if not self.store.fetch_summary(sid)
+                or (include_technical and not self.store.fetch_technical_index(sid))
             ]
 
-        generated: dict[str, str] = {}
+        generated: dict[str, dict] = {}
         total = len(session_ids)
 
         for i, sid in enumerate(session_ids):
             if i % batch_size == 0:
-                logger.info(f"Precomputing summaries: {i}/{total}")
+                logger.info("Precomputing: %d/%d", i, total)
 
-            transcript = self.store.fetch_transcript(sid)
-            if not transcript:
-                continue
+            try:
+                transcript = self.store.fetch_transcript(sid)
+                if not transcript:
+                    continue
 
-            meta = self._get_metadata(sid) or {}
-            summary = self._generate_summary(transcript, meta)
-            if summary:
-                self.store.update_summary(sid, summary)
-                generated[sid] = summary
+                meta = self._get_metadata(sid) or {}
+                result: dict = {}
 
-        logger.info(f"Precomputed {len(generated)}/{total} summaries")
+                if not self.store.fetch_summary(sid):
+                    summary = self._generate_summary(transcript, meta)
+                    if summary:
+                        self.store.update_summary(sid, summary)
+                        result["summary"] = summary
+
+                if include_technical and not self.store.fetch_technical_index(sid):
+                    raw = self._generate_technical_index(transcript, meta)
+                    if raw and raw.strip().upper() != "NONE":
+                        self.store.update_technical_index(sid, raw)
+                        result["technical_index"] = raw
+
+                if result:
+                    generated[sid] = result
+
+            except Exception as e:
+                logger.error("Precompute failed for %s: %s", sid, e)
+
+        logger.info(
+            "Precompute complete: %d/%d sessions updated (technical=%s)",
+            len(generated), total, include_technical,
+        )
         return generated
 
     # ── LLM interaction ────────────────────────────────────────────────────────
