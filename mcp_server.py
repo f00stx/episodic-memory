@@ -303,7 +303,12 @@ def _get_engine() -> Any:
     if _engine is None:
         store_path = os.environ.get("EPISODIC_MEMORY_STORE_PATH", "~/.ctm/memory")
         store_path = Path(store_path).expanduser()
-        logger.info("Initialising RecallEngine with store_path=%s", store_path)
+
+        llm_base_url = os.environ.get("EPISODIC_LLM_BASE_URL", "http://localhost:11434/v1")
+        llm_model    = os.environ.get("EPISODIC_LLM_MODEL",    "llama3")
+        llm_api_key  = os.environ.get("EPISODIC_LLM_API_KEY",  "none")
+
+        logger.info("Initialising RecallEngine with store_path=%s llm=%s %s", store_path, llm_base_url, llm_model)
 
         from episodic_memory import RecallEngine
 
@@ -315,8 +320,10 @@ def _get_engine() -> Any:
             filter_roleplay=True,
             embedding_device="cpu",
             embedding_model="BAAI/bge-large-en-v1.5",  # matches cached embeddings (1024-dim)
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            llm_api_key=llm_api_key,
         )
-        # Defer n_episodes access -- it triggers BGE load. Just log path.
         logger.info("RecallEngine initialised at %s", store_path)
     return _engine
 

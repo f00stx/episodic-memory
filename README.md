@@ -160,6 +160,22 @@ recall = EpisodicRecall(
 
 Summaries are persisted to SQLite after generation - the LLM is only called once per episode.
 
+When using the MCP server, the endpoint is configurable via environment variables (no source edits required):
+
+| Variable | Default | Description |
+|---|---|---|
+| `EPISODIC_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL |
+| `EPISODIC_LLM_MODEL` | `llama3` | Model name passed in the chat completion request |
+| `EPISODIC_LLM_API_KEY` | `none` | API key (use `none` for local endpoints) |
+
+Example -- point the MCP server at a vLLM instance serving qwen-coder:
+
+```bash
+EPISODIC_LLM_BASE_URL=http://localhost:8003/v1 \
+EPISODIC_LLM_MODEL=qwen2.5-coder-32b-instruct \
+python mcp_server.py
+```
+
 ## Semantic tags
 
 Episodes are tagged automatically at store time - zero LLM cost:
