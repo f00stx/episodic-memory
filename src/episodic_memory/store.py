@@ -384,6 +384,30 @@ class EpisodicMemoryStore:
             conn.commit()
         return cur.rowcount > 0
 
+    def fetch_technical_index(self, session_id: str) -> Optional[str]:
+        """Return stored technical index text, or None if not found or empty."""
+        with self._db_connect() as conn:
+            row = conn.execute(
+                "SELECT technical_index FROM episodes WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        val = row[0] if row else None
+        return val if val else None
+
+    def update_technical_index(self, session_id: str, technical_index: str) -> bool:
+        """
+        Store an LLM-generated technical index for a session after the fact.
+
+        Returns True if the session exists and was updated, False otherwise.
+        """
+        with self._db_connect() as conn:
+            cur = conn.execute(
+                "UPDATE episodes SET technical_index = ? WHERE session_id = ?",
+                (technical_index, session_id),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
     def remove(self, session_id: str) -> bool:
         """
         Remove a memory from both tiers.
@@ -505,6 +529,8 @@ class EpisodicMemoryStore:
                 conn.execute("ALTER TABLE episodes ADD COLUMN tags TEXT")
             if "expires_at" not in existing:
                 conn.execute("ALTER TABLE episodes ADD COLUMN expires_at REAL")
+            if "technical_index" not in existing:
+                conn.execute("ALTER TABLE episodes ADD COLUMN technical_index TEXT")
             conn.commit()
 
     def _upsert_cold(

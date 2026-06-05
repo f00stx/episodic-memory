@@ -537,6 +537,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payload = {
                 "session_id": result.session_id,
                 "summary": result.summary,
+                "technical_index": result.technical_index,
                 "similarity": result.similarity,
                 "turn_count": result.turn_count,
                 "stored_at": result.stored_at,

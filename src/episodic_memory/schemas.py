@@ -305,6 +305,7 @@ class RecallResult:
     superseded_by:       Optional[str]      = None          # session_id of newer episode
     superseded_by_summary: Optional[str]    = None          # summary of newer episode
     supersession_age_gap_str: Optional[str] = None          # human-readable age gap
+    technical_index:     Optional[str]      = None          # fact-preserving technical index
 
     def context_injection(self) -> str:
         """
@@ -336,6 +337,10 @@ class RecallResult:
         )
         if self.summary:
             lines.append(self.summary.strip())
+
+        if self.technical_index:
+            lines.append("[Technical index -- named artefacts from this session:]")
+            lines.append(self.technical_index.strip())
 
         if self.is_superseded and self.superseded_by_summary:
             import datetime as _dt
