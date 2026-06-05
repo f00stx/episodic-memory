@@ -100,6 +100,7 @@ class RecallEngine:
         technical_llm_base_url:         Optional[str] = None,
         technical_llm_model:            Optional[str] = None,
         technical_llm_api_key:          Optional[str] = None,
+        project_scope:                  Optional[str] = None,
     ) -> None:
         self._store_path = Path(store_path).expanduser()
         self._recall_threshold      = recall_threshold
@@ -114,6 +115,7 @@ class RecallEngine:
         self._technical_llm_base_url = technical_llm_base_url
         self._technical_llm_model    = technical_llm_model
         self._technical_llm_api_key  = technical_llm_api_key
+        self._project_scope          = project_scope or None
 
         self._resonance: Optional["DirectTextResonance"] = None  # lazy-loaded
         self._recall_mod: Optional["EpisodicRecall"]     = None  # lazy-loaded
@@ -165,12 +167,20 @@ class RecallEngine:
             exclude_tags=exclude_tags,
             only_tags=only_tags,
             include_expired=include_expired,
+            project_scope=self._project_scope,
         )
 
         if not res.triggered_recall or not res.top_k_ids:
             # FTS fallback: keyword search across technical indexes for queries
             # that score near-zero on the semantic path.
-            fts_hits = self._get_store().fts_search_technical(text, top_k=1)
+            fts_hits = self._get_store().fts_search_technical(text, top_k=5)
+            if self._project_scope and fts_hits:
+                store = self._get_store()
+                fts_hits = [
+                    sid for sid in fts_hits
+                    if store._session_index.get(sid) is not None
+                    and store._hot_metadata[store._session_index[sid]].get("project") == self._project_scope
+                ]
             if not fts_hits:
                 return None
             top_session_id = fts_hits[0]
@@ -209,7 +219,11 @@ class RecallEngine:
         slow-path recall.  Useful for injecting emotional colouring into state
         without the latency of a SQLite + LLM call.
         """
-        return self._get_resonance().query(text, exclude_session_id=exclude_session_id)
+        return self._get_resonance().query(
+            text,
+            exclude_session_id=exclude_session_id,
+            project_scope=self._project_scope,
+        )
 
     @property
     def n_episodes(self) -> int:

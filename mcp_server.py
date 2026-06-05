@@ -313,9 +313,12 @@ def _get_engine() -> Any:
         technical_llm_model    = os.environ.get("EPISODIC_TECHNICAL_LLM_MODEL",    "qwen2.5-coder-32b-instruct")
         technical_llm_api_key  = os.environ.get("EPISODIC_TECHNICAL_LLM_API_KEY",  llm_api_key)
 
+        project_scope = os.environ.get("EPISODIC_PROJECT_SCOPE", "").strip() or None
+
         logger.info(
-            "Initialising RecallEngine store=%s summary=%s@%s technical=%s@%s",
+            "Initialising RecallEngine store=%s summary=%s@%s technical=%s@%s scope=%s",
             store_path, llm_model, llm_base_url, technical_llm_model, technical_llm_base_url,
+            project_scope or "(none)",
         )
 
         from episodic_memory import RecallEngine
@@ -334,6 +337,7 @@ def _get_engine() -> Any:
             technical_llm_base_url=technical_llm_base_url,
             technical_llm_model=technical_llm_model,
             technical_llm_api_key=technical_llm_api_key,
+            project_scope=project_scope,
         )
         logger.info("RecallEngine initialised at %s", store_path)
     return _engine
@@ -578,16 +582,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "memory_stats":
             engine = _get_engine()
-            # Build emotion / archetype distributions from hot metadata
+            scope = engine._project_scope
             emotions: dict[str, int] = {}
             archetypes: dict[str, int] = {}
             tags: dict[str, int] = {}
             from episodic_memory.store import EpisodicMemoryStore
 
             store = EpisodicMemoryStore(engine.store_path)
+            n_scoped = 0
             for meta in store._hot_metadata:
                 if meta.get("_removed"):
                     continue
+                if scope and meta.get("project") != scope:
+                    continue
+                n_scoped += 1
                 emo = meta.get("dominant_emotion", "neutral")
                 emotions[emo] = emotions.get(emo, 0) + 1
                 arch = meta.get("dominant_archetype", "sage")
@@ -596,8 +604,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     tags[t] = tags.get(t, 0) + 1
 
             payload = {
-                "n_episodes": engine.n_episodes,
+                "n_episodes": n_scoped,
                 "store_path": str(engine.store_path),
+                "project_scope": scope,
                 "emotion_distribution": emotions,
                 "archetype_distribution": archetypes,
                 "tags": tags,
@@ -629,12 +638,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "memory_list":
             from episodic_memory.store import EpisodicMemoryStore
 
-            store = EpisodicMemoryStore(_get_engine().store_path)
+            engine = _get_engine()
+            scope = engine._project_scope
+            store = EpisodicMemoryStore(engine.store_path)
             limit = arguments.get("limit", 100)
             offset = arguments.get("offset", 0)
 
+            all_meta = [m for m in store._hot_metadata if not m.get("_removed")]
+            if scope:
+                all_meta = [m for m in all_meta if m.get("project") == scope]
+
             sorted_meta = sorted(
-                [m for m in store._hot_metadata if not m.get("_removed")],
+                all_meta,
                 key=lambda m: m.get("stored_at", 0.0),
                 reverse=True,
             )
@@ -653,9 +668,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
 
             payload = {
-                "total": store.n_episodes,
+                "total": len(all_meta),
                 "offset": offset,
                 "limit": limit,
+                "project_scope": scope,
                 "sessions": items,
             }
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]

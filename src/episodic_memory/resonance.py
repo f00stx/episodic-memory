@@ -324,6 +324,13 @@ class DirectTextResonance:
             for s, t in zip(self._summaries, self._technical_indexes)
         ]
 
+        # Project field from hot_metadata -- used for project-scope filtering.
+        # Sessions not found in hot_meta get "" (invisible to scoped agents).
+        self._projects = [
+            self._hot_meta.get(sid, {}).get("project", "")
+            for sid in self._session_ids
+        ]
+
         # Load hot metadata for emotion_cats lookup
         with open(hot_metadata_path) as f:
             hot_meta_list = json.load(f)
@@ -386,6 +393,7 @@ class DirectTextResonance:
         exclude_tags:       list[str] | None = None,
         only_tags:          list[str] | None = None,
         include_expired:    bool = False,
+        project_scope:      str | None = None,
     ) -> "ResonanceResult":
         """
         Search episode summaries for semantic matches to *utterance_text*.
@@ -440,6 +448,11 @@ class DirectTextResonance:
             only_set = set(only_tags)
             for i, ep_tags in enumerate(self._tags):
                 if not only_set.issubset(set(ep_tags)):
+                    sims[i] = -1.0
+
+        if project_scope:
+            for i, proj in enumerate(self._projects):
+                if proj != project_scope:
                     sims[i] = -1.0
 
         top_idx = np.argsort(sims)[::-1][: self.top_k * 4]   # over-fetch to survive filtering
