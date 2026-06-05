@@ -308,7 +308,15 @@ def _get_engine() -> Any:
         llm_model    = os.environ.get("EPISODIC_LLM_MODEL",    "llama3")
         llm_api_key  = os.environ.get("EPISODIC_LLM_API_KEY",  "none")
 
-        logger.info("Initialising RecallEngine with store_path=%s llm=%s %s", store_path, llm_base_url, llm_model)
+        # Technical index LLM -- defaults to qwen-coder if not overridden
+        technical_llm_base_url = os.environ.get("EPISODIC_TECHNICAL_LLM_BASE_URL", "http://localhost:8003/v1")
+        technical_llm_model    = os.environ.get("EPISODIC_TECHNICAL_LLM_MODEL",    "qwen2.5-coder-32b-instruct")
+        technical_llm_api_key  = os.environ.get("EPISODIC_TECHNICAL_LLM_API_KEY",  llm_api_key)
+
+        logger.info(
+            "Initialising RecallEngine store=%s summary=%s@%s technical=%s@%s",
+            store_path, llm_model, llm_base_url, technical_llm_model, technical_llm_base_url,
+        )
 
         from episodic_memory import RecallEngine
 
@@ -323,6 +331,9 @@ def _get_engine() -> Any:
             llm_base_url=llm_base_url,
             llm_model=llm_model,
             llm_api_key=llm_api_key,
+            technical_llm_base_url=technical_llm_base_url,
+            technical_llm_model=technical_llm_model,
+            technical_llm_api_key=technical_llm_api_key,
         )
         logger.info("RecallEngine initialised at %s", store_path)
     return _engine

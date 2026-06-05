@@ -162,17 +162,31 @@ Summaries are persisted to SQLite after generation - the LLM is only called once
 
 When using the MCP server, the endpoint is configurable via environment variables (no source edits required):
 
+The affective summary and technical index use separate LLM endpoints, so you can route each to the model best suited to the task (e.g. a general chat model for affect, a code-trained model for technical extraction).
+
+**Affective summary** (emotional tone, relational mode):
+
 | Variable | Default | Description |
 |---|---|---|
 | `EPISODIC_LLM_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible base URL |
-| `EPISODIC_LLM_MODEL` | `llama3` | Model name passed in the chat completion request |
-| `EPISODIC_LLM_API_KEY` | `none` | API key (use `none` for local endpoints) |
+| `EPISODIC_LLM_MODEL` | `llama3` | Model name |
+| `EPISODIC_LLM_API_KEY` | `none` | API key (`none` for local endpoints) |
 
-Example -- point the MCP server at a vLLM instance serving qwen-coder:
+**Technical index** (file paths, metrics, flags, decisions):
+
+| Variable | Default | Description |
+|---|---|---|
+| `EPISODIC_TECHNICAL_LLM_BASE_URL` | `http://localhost:8003/v1` | Base URL for technical index LLM |
+| `EPISODIC_TECHNICAL_LLM_MODEL` | `qwen2.5-coder-32b-instruct` | Model for technical extraction |
+| `EPISODIC_TECHNICAL_LLM_API_KEY` | inherits `EPISODIC_LLM_API_KEY` | API key |
+
+If `EPISODIC_TECHNICAL_LLM_*` are unset, they fall back to the affective summary endpoint. Example -- explicit split configuration:
 
 ```bash
-EPISODIC_LLM_BASE_URL=http://localhost:8003/v1 \
-EPISODIC_LLM_MODEL=qwen2.5-coder-32b-instruct \
+EPISODIC_LLM_BASE_URL=http://localhost:8001/v1 \
+EPISODIC_LLM_MODEL=qwen3-30b-a3b \
+EPISODIC_TECHNICAL_LLM_BASE_URL=http://localhost:8003/v1 \
+EPISODIC_TECHNICAL_LLM_MODEL=qwen2.5-coder-32b-instruct \
 python mcp_server.py
 ```
 

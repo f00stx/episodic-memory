@@ -127,24 +127,32 @@ class EpisodicRecall:
 
     def __init__(
         self,
-        store:                      "EpisodicMemoryStore",
-        llm_base_url:               str   = "http://localhost:11434/v1",
-        llm_model:                  str   = "llama3",
-        llm_api_key:                str   = "none",
-        max_transcript_turns:       int   = 30,
-        summary_max_tokens:         int   = 150,
-        technical_index_max_tokens: int   = 400,
-        timeout:                    float = 20.0,
+        store:                          "EpisodicMemoryStore",
+        llm_base_url:                   str   = "http://localhost:11434/v1",
+        llm_model:                      str   = "llama3",
+        llm_api_key:                    str   = "none",
+        technical_llm_base_url:         Optional[str] = None,
+        technical_llm_model:            Optional[str] = None,
+        technical_llm_api_key:          Optional[str] = None,
+        max_transcript_turns:           int   = 30,
+        summary_max_tokens:             int   = 150,
+        technical_index_max_tokens:     int   = 400,
+        timeout:                        float = 20.0,
     ) -> None:
         self.store                      = store
         self.llm_base_url               = llm_base_url
         self.llm_model                  = llm_model
         self.llm_api_key                = llm_api_key
+        # Technical index LLM -- falls back to affective summary endpoint if not set
+        self.technical_llm_base_url     = technical_llm_base_url or llm_base_url
+        self.technical_llm_model        = technical_llm_model or llm_model
+        self.technical_llm_api_key      = technical_llm_api_key or llm_api_key
         self.max_transcript_turns       = max_transcript_turns
         self.summary_max_tokens         = summary_max_tokens
         self.technical_index_max_tokens = technical_index_max_tokens
         self.timeout                    = timeout
-        self._client: Optional[object]  = None
+        self._client: Optional[object]          = None
+        self._technical_client: Optional[object] = None
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -382,8 +390,8 @@ class EpisodicRecall:
 
         try:
             t0 = time.perf_counter()
-            response = client.chat.completions.create(
-                model       = self.llm_model,
+            response = self._get_technical_client().chat.completions.create(
+                model       = self.technical_llm_model,
                 messages    = [
                     {"role": "system", "content": _TECHNICAL_SYSTEM},
                     {"role": "user",   "content": user_msg},
@@ -404,7 +412,7 @@ class EpisodicRecall:
             return ""
 
     def _get_client(self) -> object:
-        """Lazy-init OpenAI-compatible client."""
+        """Lazy-init OpenAI-compatible client for affective summary."""
         if self._client is None:
             from openai import OpenAI
             self._client = OpenAI(
@@ -412,6 +420,16 @@ class EpisodicRecall:
                 api_key  = self.llm_api_key,
             )
         return self._client
+
+    def _get_technical_client(self) -> object:
+        """Lazy-init OpenAI-compatible client for technical index (may differ from summary client)."""
+        if self._technical_client is None:
+            from openai import OpenAI
+            self._technical_client = OpenAI(
+                base_url = self.technical_llm_base_url,
+                api_key  = self.technical_llm_api_key,
+            )
+        return self._technical_client
 
     # ── Utilities ──────────────────────────────────────────────────────────────
 

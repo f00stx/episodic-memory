@@ -94,20 +94,26 @@ class RecallEngine:
         filter_roleplay:     bool  = True,
         embedding_device:    str   = "cpu",
         embedding_model:     str   = "BAAI/bge-small-en-v1.5",
-        llm_base_url:        str   = "http://localhost:11434/v1",
-        llm_model:           str   = "llama3",
-        llm_api_key:         str   = "none",
+        llm_base_url:                   str           = "http://localhost:11434/v1",
+        llm_model:                      str           = "llama3",
+        llm_api_key:                    str           = "none",
+        technical_llm_base_url:         Optional[str] = None,
+        technical_llm_model:            Optional[str] = None,
+        technical_llm_api_key:          Optional[str] = None,
     ) -> None:
         self._store_path = Path(store_path).expanduser()
-        self._recall_threshold    = recall_threshold
-        self._resonance_threshold = resonance_threshold
-        self._top_k               = top_k
-        self._filter_roleplay     = filter_roleplay
-        self._embedding_device    = embedding_device
-        self._embedding_model     = embedding_model
-        self._llm_base_url        = llm_base_url
-        self._llm_model           = llm_model
-        self._llm_api_key         = llm_api_key
+        self._recall_threshold      = recall_threshold
+        self._resonance_threshold   = resonance_threshold
+        self._top_k                 = top_k
+        self._filter_roleplay       = filter_roleplay
+        self._embedding_device      = embedding_device
+        self._embedding_model       = embedding_model
+        self._llm_base_url          = llm_base_url
+        self._llm_model             = llm_model
+        self._llm_api_key           = llm_api_key
+        self._technical_llm_base_url = technical_llm_base_url
+        self._technical_llm_model    = technical_llm_model
+        self._technical_llm_api_key  = technical_llm_api_key
 
         self._resonance: Optional["DirectTextResonance"] = None  # lazy-loaded
         self._recall_mod: Optional["EpisodicRecall"]     = None  # lazy-loaded
@@ -287,6 +293,9 @@ class RecallEngine:
                 llm_base_url=self._llm_base_url,
                 llm_model=self._llm_model,
                 llm_api_key=self._llm_api_key,
+                technical_llm_base_url=self._technical_llm_base_url,
+                technical_llm_model=self._technical_llm_model,
+                technical_llm_api_key=self._technical_llm_api_key,
             )
         return self._recall_mod
 
