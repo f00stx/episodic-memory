@@ -384,6 +384,50 @@ class EpisodicMemoryStore:
             conn.commit()
         return cur.rowcount > 0
 
+    def fts_search_technical(
+        self,
+        query_text: str,
+        top_k: int = 5,
+    ) -> list[str]:
+        """
+        Keyword fallback search across technical_index column.
+
+        Extracts meaningful words from query_text (>3 chars, not stopwords),
+        counts how many appear in each episode's technical_index, and returns
+        the top-k session_ids ranked by match count.
+
+        Used as a fallback when the semantic resonance path returns no match --
+        catches sessions whose affective summary shares no vocabulary with the
+        query but whose technical index contains the exact terms.
+        """
+        _STOPWORDS = {
+            "that", "this", "with", "from", "have", "what", "were",
+            "they", "been", "your", "when", "which", "will", "does",
+            "about", "there", "their", "would", "could", "should",
+        }
+        words = [
+            w.lower() for w in query_text.split()
+            if len(w) > 3 and w.lower() not in _STOPWORDS
+        ]
+        if not words:
+            return []
+
+        with self._db_connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id, technical_index FROM episodes "
+                "WHERE technical_index IS NOT NULL AND technical_index != ''"
+            ).fetchall()
+
+        scored: list[tuple[int, str]] = []
+        for session_id, tech_idx in rows:
+            tech_lower = tech_idx.lower()
+            score = sum(1 for w in words if w in tech_lower)
+            if score > 0:
+                scored.append((score, session_id))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [sid for _, sid in scored[:top_k]]
+
     def fetch_technical_index(self, session_id: str) -> Optional[str]:
         """Return stored technical index text, or None if not found or empty."""
         with self._db_connect() as conn:

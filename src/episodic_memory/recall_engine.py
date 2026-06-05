@@ -168,10 +168,16 @@ class RecallEngine:
         )
 
         if not res.triggered_recall or not res.top_k_ids:
-            return None
-
-        top_session_id = res.top_k_ids[0]
-        top_sim        = res.top_k_similarities[0]
+            # FTS fallback: keyword search across technical indexes for queries
+            # that score near-zero on the semantic path.
+            fts_hits = self._get_store().fts_search_technical(text, top_k=1)
+            if not fts_hits:
+                return None
+            top_session_id = fts_hits[0]
+            top_sim        = 0.3   # synthetic -- signals FTS match, not semantic match
+        else:
+            top_session_id = res.top_k_ids[0]
+            top_sim        = res.top_k_similarities[0]
 
         recall_result = recall_mod.recall(
             session_id=top_session_id,

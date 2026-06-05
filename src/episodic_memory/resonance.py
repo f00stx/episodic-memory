@@ -298,22 +298,31 @@ class DirectTextResonance:
         self.top_k               = top_k
         self._roleplay_filter    = RoleplayFilter() if filter_roleplay else None
 
-        # Load summaries from cold store
+        # Load summaries and technical indexes from cold store
         conn = sqlite3.connect(db_path)
         rows = conn.execute(
             "SELECT session_id, summary, dominant_emotion, dominant_archetype, stored_at, "
-            "COALESCE(tags, '[]') as tags, expires_at "
+            "COALESCE(tags, '[]') as tags, expires_at, technical_index "
             "FROM episodes WHERE summary IS NOT NULL AND summary != ''"
         ).fetchall()
         conn.close()
 
-        self._session_ids    = [r[0] for r in rows]
-        self._summaries      = [r[1] for r in rows]
-        self._dom_emotions   = [r[2] for r in rows]
-        self._dom_archetypes = [r[3] for r in rows]
-        self._stored_ats     = [float(r[4]) if r[4] else 0.0 for r in rows]
-        self._tags           = [json.loads(r[5]) if r[5] else [] for r in rows]
-        self._expires_ats    = [float(r[6]) if r[6] is not None else None for r in rows]
+        self._session_ids       = [r[0] for r in rows]
+        self._summaries         = [r[1] for r in rows]
+        self._dom_emotions      = [r[2] for r in rows]
+        self._dom_archetypes    = [r[3] for r in rows]
+        self._stored_ats        = [float(r[4]) if r[4] else 0.0 for r in rows]
+        self._tags              = [json.loads(r[5]) if r[5] else [] for r in rows]
+        self._expires_ats       = [float(r[6]) if r[6] is not None else None for r in rows]
+        self._technical_indexes = [r[7] or "" for r in rows]
+
+        # Blended search texts: summary + technical index when available.
+        # Used for embedding only -- roleplay filter and contradiction detection
+        # still operate on affective summaries alone.
+        self._search_texts = [
+            (s + "\n\n" + t).strip() if t else s
+            for s, t in zip(self._summaries, self._technical_indexes)
+        ]
 
         # Load hot metadata for emotion_cats lookup
         with open(hot_metadata_path) as f:
@@ -328,7 +337,8 @@ class DirectTextResonance:
         cache_dir  = os.path.join(os.path.dirname(db_path), "embed_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_key  = hashlib.md5("".join(self._session_ids).encode()).hexdigest()
-        cache_path = os.path.join(cache_dir, f"summary_embs_{cache_key}.npy")
+        # blended_embs: summary + technical_index combined text (separate from legacy summary_embs)
+        cache_path = os.path.join(cache_dir, f"blended_embs_{cache_key}.npy")
         db_mtime   = os.path.getmtime(db_path)
 
         if (
@@ -336,24 +346,24 @@ class DirectTextResonance:
             and os.path.getmtime(cache_path) >= db_mtime
         ):
             log.info(
-                "DirectTextResonance: loading %d cached embeddings from disk...",
-                len(self._summaries),
+                "DirectTextResonance: loading %d cached blended embeddings from disk...",
+                len(self._search_texts),
             )
             self._summary_embs = np.load(cache_path)
         else:
+            n_blended = sum(1 for t in self._technical_indexes if t)
             log.info(
-                "DirectTextResonance: pre-computing %d summary embeddings...",
-                len(self._summaries),
+                "DirectTextResonance: pre-computing %d blended embeddings (%d with technical index)...",
+                len(self._search_texts), n_blended,
             )
-            # Batch all summaries in one call -- ~100x faster than individual embed_one() calls
-            raw_embs = self.embedding_client.embed(self._summaries)  # (N, 1536)
+            raw_embs = self.embedding_client.embed(self._search_texts)  # (N, dim)
             norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
             self._summary_embs = (raw_embs / (norms + 1e-8)).astype(np.float32)
             np.save(cache_path, self._summary_embs)
             log.info(
-                "DirectTextResonance: embeddings cached -> %s", cache_path,
+                "DirectTextResonance: blended embeddings cached -> %s", cache_path,
             )
-        log.info("DirectTextResonance: ready (%d episodes indexed)", len(self._summaries))
+        log.info("DirectTextResonance: ready (%d episodes indexed)", len(self._session_ids))
 
         # Build ContradictionDetector over the same embeddings (no extra embedding cost)
         self._contradiction_detector = ContradictionDetector(
